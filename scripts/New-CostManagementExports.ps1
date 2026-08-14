@@ -7,11 +7,22 @@ Run New-CostExportStorage.ps1 first -- this script needs the storage account
 resource ID it provisions.
 
 Datasets and scope, per tutorial limitations:
-  - Subscription scope: actual cost/usage export ("ActualCost"). This is
-    the scope to use when your billing is managed by a reseller/vendor
-    (CSP / Microsoft Partner Agreement) and you don't have billing account
-    access -- MPA customers are supported at customer, subscription, and
-    resource group scope for actual cost, but NOT at billing account scope.
+  - Subscription scope: actual cost/usage export ("ActualCost"), one per
+    subscription in -SubscriptionIds. This is the scope to use when your
+    billing is managed by a reseller/vendor (CSP / Microsoft Partner
+    Agreement) and you don't have billing account access -- MPA customers
+    are supported at customer, subscription, and resource group scope for
+    actual cost, but NOT at billing account scope. Every subscription's
+    export writes to its own rootFolderPath (actualcost/<label>) under the
+    same storage account, so multiple subscriptions can feed one Power BI
+    report from a single container. This only requires: (a) Owner/Contributor
+    on each source subscription to create its export, and (b)
+    roleAssignments/write on the destination storage account (wherever it
+    lives) so Azure can auto-grant each export's managed identity access --
+    the storage account's own "Permitted scope for copy operations" needs
+    to stay unrestricted ("From any storage account") for this
+    cross-subscription write to work; New-CostExportStorage.ps1 leaves it
+    that way by not setting -AllowedCopyScope.
   - Management group scope only supports the "Usage" (actual cost) export
     type, and only for Enterprise Agreement (EA) billing -- not MCA/MPA.
     Price sheet, amortized cost, and reservation datasets are not supported
@@ -31,9 +42,11 @@ in preview and don't expose the reservation-recommendation dataset filters
 PUT is idempotent here: re-running with the same export names updates the
 existing exports in place.
 
-Usage (vendor-managed billing -- subscription scope only):
+Usage (vendor-managed billing -- one export per subscription, all landing in
+the same central storage account so they can all feed one Power BI report):
   .\New-CostManagementExports.ps1 `
-      -SubscriptionId 00000000-0000-0000-0000-000000000000 `
+      -SubscriptionIds "eb9a9f59-...","c0ae4ee0-...","865fa361-..." `
+      -SubscriptionLabels "sandbox","test","ldm-prod" `
       -StorageAccountResourceId "/subscriptions/.../storageAccounts/stcostexportsprod" `
       -Location eastus2
 
@@ -47,7 +60,8 @@ Usage (EA with management group + billing account access):
   Add -DryRun to print the request bodies without calling the API.
 #>
 param(
-  [string]$SubscriptionId = "",
+  [string[]]$SubscriptionIds = @(),
+  [string[]]$SubscriptionLabels = @(),
   [string]$ManagementGroupId = "",
   [string]$BillingAccountId = "",
   [Parameter(Mandatory)][string]$StorageAccountResourceId,
@@ -63,8 +77,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not $SubscriptionId -and -not $ManagementGroupId -and -not $BillingAccountId) {
-  Write-Error "Pass at least one of -SubscriptionId, -ManagementGroupId, or -BillingAccountId."
+if ($SubscriptionIds.Count -eq 0 -and -not $ManagementGroupId -and -not $BillingAccountId) {
+  Write-Error "Pass at least one of -SubscriptionIds, -ManagementGroupId, or -BillingAccountId."
+}
+if ($SubscriptionLabels.Count -gt 0 -and $SubscriptionLabels.Count -ne $SubscriptionIds.Count) {
+  Write-Error "-SubscriptionLabels must have the same number of entries as -SubscriptionIds (or be omitted)."
 }
 
 $recurrenceFrom = (Get-Date).ToUniversalTime().Date
@@ -141,11 +158,14 @@ function Publish-Export {
   }
 }
 
-if ($SubscriptionId) {
-  $subScope = "/subscriptions/$SubscriptionId"
+for ($i = 0; $i -lt $SubscriptionIds.Count; $i++) {
+  $subId = $SubscriptionIds[$i]
+  $label = if ($SubscriptionLabels.Count -gt $i) { $SubscriptionLabels[$i] } else { $subId }
+
+  $subScope = "/subscriptions/$subId"
   $body = New-ExportBody -Type "ActualCost" -Timeframe "MonthToDate" -Recurrence "Daily" `
-    -RootFolderPath "actualcost" -Granularity "Daily"
-  Publish-Export -ScopePath $subScope -ExportName "$ExportNamePrefix-actualcost" -Body $body
+    -RootFolderPath "actualcost/$label" -Granularity "Daily"
+  Publish-Export -ScopePath $subScope -ExportName "$ExportNamePrefix-actualcost-$label" -Body $body
 }
 
 if ($ManagementGroupId) {

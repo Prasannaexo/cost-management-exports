@@ -15,14 +15,22 @@ What this does:
          so it can only reach a firewalled account through this bypass.
        - TLS 1.2 minimum, HTTPS-only, no shared-key access (Entra ID / RBAC
          only), blob versioning + 14-day soft delete.
+       - "Permitted scope for copy operations" left unrestricted (the
+         AllowedCopyScope property is simply never set) so this account can
+         receive exports from ANY subscription -- not just ones in the same
+         AAD tenant. This is what lets one central account collect Cost
+         Management data transferred in from every subscription you manage,
+         not only the one it lives in. Never add -AllowedCopyScope to the
+         New-AzStorageAccount call below unless you deliberately want to
+         narrow this.
   3. Creates the destination blob container.
   4. Grants Storage Blob Data Contributor on the account to the caller (or
      -GrantAccessToPrincipalId) -- container creation is a data-plane
      operation, which management-plane roles like Owner do not cover once
      shared-key access is disabled.
 
-Run New-CostManagementExports.ps1 afterwards to create the exports against
-the storage account this script provisions.
+Run New-CostManagementExports.ps1 afterwards to create the exports (one per
+source subscription) against the storage account this script provisions.
 
 Usage:
   .\New-CostExportStorage.ps1 -SubscriptionId <sub-id> `
@@ -124,6 +132,13 @@ $ctx = New-AzStorageContext -StorageAccountName $StorageAccountName -UseConnecte
 $container = Get-AzStorageContainer -Name $ContainerName -Context $ctx -ErrorAction SilentlyContinue
 if (-not $container) {
   New-AzStorageContainer -Name $ContainerName -Context $ctx -Permission Off | Out-Null
+}
+
+$sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName
+if ($sa.AllowedCopyScope) {
+  Write-Warning "AllowedCopyScope is set to '$($sa.AllowedCopyScope)' -- this restricts which subscriptions/tenants can transfer data into this account. Cost Management's 'Permitted scope for copy operations' requirement is 'From any storage account' (unrestricted). Clear it in the portal (Networking > this setting) if you need exports from other subscriptions to land here."
+} else {
+  Write-Host "Permitted scope for copy operations: unrestricted (From any storage account) -- OK for cross-subscription exports." -ForegroundColor Green
 }
 
 Write-Host "`nDone. Pass this resource ID as -StorageAccountResourceId to New-CostManagementExports.ps1:" -ForegroundColor Green
