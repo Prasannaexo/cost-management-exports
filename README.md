@@ -47,29 +47,32 @@ access you likely don't have as a CSP customer, so just omit
 
 ## Setup
 
-Example using this org's subscriptions (from the `scaling-infra` Terraform
-repo's runbooks) -- one central storage account in the Sandbox/primary
-subscription, fed by exports from all three:
+Example using this org's subscriptions (three from the `scaling-infra`
+Terraform repo's runbooks, plus the Dev subscription referenced but not
+recorded with an ID in that repo) -- one central storage account in the
+**LDM internal prod** subscription (the actual primary subscription), fed
+by exports from all four:
 
 | Label | Subscription ID | Source |
 | --- | --- | --- |
-| `sandbox` | `eb9a9f59-a1df-475f-b951-bfd41f253982` | Sandbox / primary |
+| `ldm-prod` | `865fa361-a42e-4d3f-8566-cc34114cb8be` | LDM internal prod (primary -- hosts the storage account) |
+| `sandbox` | `eb9a9f59-a1df-475f-b951-bfd41f253982` | Sandbox |
+| `dev` | `86a78b30-a351-425e-9692-6a3938a559cf` | Azure Subscription- Dev |
 | `test` | `c0ae4ee0-ebef-4f37-a8e8-d590fc7417ba` | Test Subscription |
-| `ldm-prod` | `865fa361-a42e-4d3f-8566-cc34114cb8be` | LDM internal prod |
 
 ```powershell
-# 1. Provision the firewalled storage account + container, in the Sandbox
-#    subscription (where this org's other shared platform resources live)
+# 1. Provision the firewalled storage account + container, in the LDM
+#    internal prod subscription (the primary subscription)
 .\scripts\New-CostExportStorage.ps1 `
-    -SubscriptionId "eb9a9f59-a1df-475f-b951-bfd41f253982" `
+    -SubscriptionId "865fa361-a42e-4d3f-8566-cc34114cb8be" `
     -StorageAccountName "stcostexportsprod" `
     -Location "eastus2"
 
 # 2. Create one export per subscription against it, all landing in the
 #    same container
 .\scripts\New-CostManagementExports.ps1 `
-    -SubscriptionIds "eb9a9f59-a1df-475f-b951-bfd41f253982","c0ae4ee0-ebef-4f37-a8e8-d590fc7417ba","865fa361-a42e-4d3f-8566-cc34114cb8be" `
-    -SubscriptionLabels "sandbox","test","ldm-prod" `
+    -SubscriptionIds "865fa361-a42e-4d3f-8566-cc34114cb8be","eb9a9f59-a1df-475f-b951-bfd41f253982","86a78b30-a351-425e-9692-6a3938a559cf","c0ae4ee0-ebef-4f37-a8e8-d590fc7417ba" `
+    -SubscriptionLabels "ldm-prod","sandbox","dev","test" `
     -StorageAccountResourceId "<resource ID printed by step 1>"
 ```
 
@@ -144,8 +147,9 @@ Two ways to bring that into Power BI:
    Reader role on the account -- ask whoever ran `New-CostExportStorage.ps1`
    to grant it, since shared keys are disabled on this account).
 3. Navigate to the `cost-management-exports` container. Each subscription's
-   data lands under its own label, e.g. `actualcost/sandbox/finops-actualcost-sandbox/`,
-   `actualcost/test/finops-actualcost-test/`, `actualcost/ldm-prod/finops-actualcost-ldm-prod/`.
+   data lands under its own label, e.g. `actualcost/ldm-prod/finops-actualcost-ldm-prod/`,
+   `actualcost/sandbox/finops-actualcost-sandbox/`, `actualcost/dev/finops-actualcost-dev/`,
+   `actualcost/test/finops-actualcost-test/`.
 4. Use **Combine & Transform** on the `actualcost/` folder (not just one
    subscription's subfolder) so Power Query unions every subscription and
    every partition automatically -- this also picks up new daily runs
