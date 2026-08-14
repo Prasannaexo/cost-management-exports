@@ -23,7 +23,14 @@ What this does:
          not only the one it lives in. Never add -AllowedCopyScope to the
          New-AzStorageAccount call below unless you deliberately want to
          narrow this.
-  3. Creates the destination blob container.
+  3. Creates the destination blob container. This runs from wherever you
+     run this script, over the account's public data-plane endpoint --
+     which the firewall configured in step 2 denies by default. So this
+     script auto-detects the caller's current public IP (via api.ipify.org)
+     and allows it through the firewall unless -SkipCallerIpRule is passed.
+     Without that, container creation 403s even with the right RBAC role,
+     because the request itself never reaches the account's authorization
+     check -- it's blocked at the network layer first.
   4. Grants Storage Blob Data Contributor on the account to the caller (or
      -GrantAccessToPrincipalId) -- container creation is a data-plane
      operation, which management-plane roles like Owner do not cover once
@@ -31,6 +38,9 @@ What this does:
 
 Run New-CostManagementExports.ps1 afterwards to create the exports (one per
 source subscription) against the storage account this script provisions.
+Re-running this script is safe (idempotent) -- it reuses the existing
+resource group/account/role assignment and just retries whatever step
+didn't finish, e.g. after a network or RBAC propagation delay.
 
 Usage:
   .\New-CostExportStorage.ps1 -SubscriptionId <sub-id> `
@@ -47,7 +57,8 @@ param(
   [string]$Location = "eastus2",
   [string]$ContainerName = "cost-management-exports",
   [string[]]$AllowedIpRanges = @(),
-  [string]$GrantAccessToPrincipalId = ""
+  [string]$GrantAccessToPrincipalId = "",
+  [switch]$SkipCallerIpRule
 )
 
 $ErrorActionPreference = "Stop"
@@ -88,6 +99,18 @@ if (-not $sa) {
   Write-Host "Storage account $StorageAccountName already exists -- reusing." -ForegroundColor Yellow
 }
 
+if (-not $SkipCallerIpRule) {
+  try {
+    $callerIp = (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10).Trim()
+    if ($AllowedIpRanges -notcontains $callerIp) {
+      Write-Host "Detected caller public IP $callerIp -- allowing it through the firewall (container creation below needs it). Pass -SkipCallerIpRule to opt out." -ForegroundColor Cyan
+      $AllowedIpRanges = @($AllowedIpRanges) + $callerIp
+    }
+  } catch {
+    Write-Warning "Could not auto-detect caller public IP ($_). Container creation below may 403 unless -AllowedIpRanges already covers this machine's IP."
+  }
+}
+
 Write-Host "Configuring firewall: default deny + AzureServices trusted-service bypass..." -ForegroundColor Cyan
 $ruleSetParams = @{
   ResourceGroupName = $ResourceGroupName
@@ -99,6 +122,8 @@ if ($AllowedIpRanges.Count -gt 0) {
   $ruleSetParams["IPRule"] = @($AllowedIpRanges | ForEach-Object { @{ IPAddressOrRange = $_; Action = "allow" } })
 }
 Update-AzStorageAccountNetworkRuleSet @ruleSetParams | Out-Null
+Write-Host "Waiting for firewall rule to propagate..." -ForegroundColor Cyan
+Start-Sleep -Seconds 20
 
 Write-Host "Enabling blob versioning and soft delete..." -ForegroundColor Cyan
 Update-AzStorageBlobServiceProperty -ResourceGroupName $ResourceGroupName -StorageAccountName $StorageAccountName `
@@ -131,7 +156,17 @@ Write-Host "Creating container $ContainerName..." -ForegroundColor Cyan
 $ctx = New-AzStorageContext -StorageAccountName $StorageAccountName -UseConnectedAccount
 $container = Get-AzStorageContainer -Name $ContainerName -Context $ctx -ErrorAction SilentlyContinue
 if (-not $container) {
-  New-AzStorageContainer -Name $ContainerName -Context $ctx -Permission Off | Out-Null
+  $maxAttempts = 5
+  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+    try {
+      New-AzStorageContainer -Name $ContainerName -Context $ctx -Permission Off | Out-Null
+      break
+    } catch {
+      if ($attempt -eq $maxAttempts) { throw }
+      Write-Host "  Container creation failed (attempt $attempt/$maxAttempts, likely RBAC/firewall still propagating) -- retrying in 20s..." -ForegroundColor Yellow
+      Start-Sleep -Seconds 20
+    }
+  }
 }
 
 $sa = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName
