@@ -10,26 +10,33 @@ Scripts: [scripts/](scripts/)
 
 ## What gets created
 
-| Export | Scope | Dataset type | Recurrence |
-| --- | --- | --- | --- |
-| `finops-actualcost-mg` | Management group | `Usage` (actual cost) | Daily |
-| `finops-pricesheet` | Billing account | `PriceSheet` | Monthly |
-| `finops-reservationrecs` | Billing account | `ReservationRecommendations` | Daily |
+| Export | Scope | Dataset type | Recurrence | When it's created |
+| --- | --- | --- | --- | --- |
+| `finops-actualcost` | Subscription | `ActualCost` | Daily | `-SubscriptionId` passed |
+| `finops-actualcost-mg` | Management group | `Usage` (actual cost) | Daily | `-ManagementGroupId` passed (EA only) |
+| `finops-pricesheet` | Billing account | `PriceSheet` | Monthly | `-BillingAccountId` passed |
+| `finops-reservationrecs` | Billing account | `ReservationRecommendations` | Daily | `-BillingAccountId` passed |
 
-All three write CSV files to one dedicated, firewalled storage account.
+Pass whichever combination of `-SubscriptionId` / `-ManagementGroupId` /
+`-BillingAccountId` matches what you actually have access to -- only the
+matching exports are created. All of them write CSV files to one dedicated,
+firewalled storage account.
+
+**If your billing is managed by a reseller/vendor (CSP / Microsoft Partner
+Agreement)**, you typically won't have a billing account ID or management
+group to point at -- only `-SubscriptionId` is available to you. That's
+enough to get actual daily cost/usage data flowing to storage for Power BI;
+price sheet and reservation recommendations require direct billing account
+access you likely don't have as a CSP customer, so just omit
+`-BillingAccountId` and `-ManagementGroupId`.
 
 ## Prerequisites
 
-- **Confirm your agreement type before running this.** Management group
-  scope exports are only supported for **Enterprise Agreement (EA)**
-  billing, not MCA. If you're on MCA, skip `-ManagementGroupId` in
-  `New-CostManagementExports.ps1` and use a subscription scope export
-  instead (see the tutorial's supported-scopes table).
 - Owner (or Contributor + `Microsoft.Authorization/roleAssignments/write` +
   `Microsoft.Authorization/permissions/read`) on the storage account's
   subscription.
-- Owner or Reader with export permission on the target management group /
-  billing account -- see [Understand and work with scopes](https://learn.microsoft.com/en-us/azure/cost-management-billing/costs/understand-work-scopes).
+- Owner or Reader with export permission at whichever scope you're
+  exporting from -- see [Understand and work with scopes](https://learn.microsoft.com/en-us/azure/cost-management-billing/costs/understand-work-scopes).
 - PowerShell `Az` module: `Az.Accounts`, `Az.Storage`, `Az.Resources`.
 - New subscriptions can take up to 48 hours before Cost Management features
   are usable.
@@ -43,10 +50,10 @@ All three write CSV files to one dedicated, firewalled storage account.
     -StorageAccountName stcostexportsprod `
     -Location eastus2
 
-# 2. Create the exports against it
+# 2. Create the export(s) against it -- subscription scope only,
+#    for vendor/CSP-managed billing
 .\scripts\New-CostManagementExports.ps1 `
-    -ManagementGroupId <mg-id> `
-    -BillingAccountId <billing-account-id> `
+    -SubscriptionId <subscription-id> `
     -StorageAccountResourceId "<resource ID printed by step 1>"
 ```
 
@@ -94,6 +101,41 @@ not a VNet client. Exporting to a storage account with a firewall requires:
 4. First-run data can take up to 24 hours to appear. Subsequent runs land
    within ~4 hours of the scheduled run starting.
 
+## Connecting Power BI
+
+The exported CSVs land at
+`<container>/<rootFolderPath>/<exportName>/<YYYYMMDD-YYYYMMDD>/<runId>/`,
+partitioned into multiple files with a `manifest.json` per run (see above).
+Two ways to bring that into Power BI:
+
+**Option A -- Power Query against the container (simplest, good starting point)**
+
+1. In Power BI Desktop: **Get Data > Azure > Azure Blob Storage**.
+2. Enter the storage account name and authenticate (Organizational
+   account / Entra ID works if your account has the Storage Blob Data
+   Reader role on the account -- ask whoever ran `New-CostExportStorage.ps1`
+   to grant it, since shared keys are disabled on this account).
+3. Navigate to the `cost-management-exports` container, then
+   `actualcost/finops-actualcost/`.
+4. Use **Combine & Transform** on the folder of CSVs so Power Query unions
+   every partition automatically -- this also picks up new daily runs
+   without changing the query. Filter out `manifest.json` (it isn't a CSV)
+   in the query, e.g. `Table.SelectRows(Source, each [Extension] = ".csv")`.
+5. Set the dataset to refresh on a schedule that trails the export's own
+   daily run (see run-history timing below) so Power BI always has the
+   prior day's file.
+
+**Option B -- Power BI dataflow / Fabric ingestion (more scale, less manual query wrangling)**
+
+For larger, ongoing FinOps reporting, point a Power BI dataflow or a
+Fabric pipeline at the same container instead of a Desktop query -- same
+underlying files, but with proper incremental refresh and a shared,
+governed dataset other reports can reuse. Worth moving to once the
+Option A query is proven out.
+
+Either way, budget for the up-to-24-hour delay on the first file and the
+~4-hour delay on subsequent daily runs when you set the refresh schedule.
+
 ## Managing exports
 
 Via the portal (Cost Management > Exports at the relevant scope) or
@@ -117,7 +159,10 @@ Via the portal (Cost Management > Exports at the relevant scope) or
   amortized cost, no purchases/reservations, no FOCUS format, single
   currency only.
 - Price sheet and reservation recommendations: billing account or billing
-  profile scope only -- never subscription or management group.
+  profile scope only -- never subscription or management group. Under a
+  CSP/vendor-managed agreement you typically don't have billing account
+  access at all, so these two are simply unavailable to you -- subscription
+  scope actual cost is what you get.
 - Reservation recommendations reflect a current snapshot only; no
   historical backfill.
 - File partitioning cannot be disabled.

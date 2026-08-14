@@ -7,15 +7,20 @@ Run New-CostExportStorage.ps1 first -- this script needs the storage account
 resource ID it provisions.
 
 Datasets and scope, per tutorial limitations:
+  - Subscription scope: actual cost/usage export ("ActualCost"). This is
+    the scope to use when your billing is managed by a reseller/vendor
+    (CSP / Microsoft Partner Agreement) and you don't have billing account
+    access -- MPA customers are supported at customer, subscription, and
+    resource group scope for actual cost, but NOT at billing account scope.
   - Management group scope only supports the "Usage" (actual cost) export
-    type, and only for Enterprise Agreement (EA) billing -- not MCA. Price
-    sheet, amortized cost, and reservation datasets are not supported at
-    management group scope. If your agreement is MCA, do not pass
-    -ManagementGroupId; use a subscription or billing account scope instead.
+    type, and only for Enterprise Agreement (EA) billing -- not MCA/MPA.
+    Price sheet, amortized cost, and reservation datasets are not supported
+    at management group scope.
   - Price sheet and reservation recommendations are billing-account-wide
-    datasets -- they're created at billing account scope here, not
-    management group scope, regardless of which subscriptions you're
-    tracking cost for.
+    datasets -- they require direct billing account access (EA or MCA that
+    you bought directly), which a CSP/vendor-managed subscription normally
+    doesn't have. Skip -BillingAccountId if that's your situation; those
+    two exports simply won't be created.
 
 This calls the Cost Management REST API directly via Invoke-AzRestMethod
 (api-version 2023-08-01, the documented minimum for firewalled-storage
@@ -26,7 +31,13 @@ in preview and don't expose the reservation-recommendation dataset filters
 PUT is idempotent here: re-running with the same export names updates the
 existing exports in place.
 
-Usage:
+Usage (vendor-managed billing -- subscription scope only):
+  .\New-CostManagementExports.ps1 `
+      -SubscriptionId 00000000-0000-0000-0000-000000000000 `
+      -StorageAccountResourceId "/subscriptions/.../storageAccounts/stcostexportsprod" `
+      -Location eastus2
+
+Usage (EA with management group + billing account access):
   .\New-CostManagementExports.ps1 `
       -ManagementGroupId mg-acme `
       -BillingAccountId 1234567 `
@@ -36,6 +47,7 @@ Usage:
   Add -DryRun to print the request bodies without calling the API.
 #>
 param(
+  [string]$SubscriptionId = "",
   [string]$ManagementGroupId = "",
   [string]$BillingAccountId = "",
   [Parameter(Mandatory)][string]$StorageAccountResourceId,
@@ -51,8 +63,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not $ManagementGroupId -and -not $BillingAccountId) {
-  Write-Error "Pass at least one of -ManagementGroupId or -BillingAccountId."
+if (-not $SubscriptionId -and -not $ManagementGroupId -and -not $BillingAccountId) {
+  Write-Error "Pass at least one of -SubscriptionId, -ManagementGroupId, or -BillingAccountId."
 }
 
 $recurrenceFrom = (Get-Date).ToUniversalTime().Date
@@ -127,6 +139,13 @@ function Publish-Export {
   } else {
     Write-Host "  OK" -ForegroundColor Green
   }
+}
+
+if ($SubscriptionId) {
+  $subScope = "/subscriptions/$SubscriptionId"
+  $body = New-ExportBody -Type "ActualCost" -Timeframe "MonthToDate" -Recurrence "Daily" `
+    -RootFolderPath "actualcost" -Granularity "Daily"
+  Publish-Export -ScopePath $subScope -ExportName "$ExportNamePrefix-actualcost" -Body $body
 }
 
 if ($ManagementGroupId) {
