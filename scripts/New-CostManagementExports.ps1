@@ -97,9 +97,10 @@ function New-ExportBody {
     [object[]]$Filters
   )
 
-  $dataSet = @{ configuration = @{ dataVersion = "2023-05-01" } }
+  $dataSet = @{ configuration = @{} }
   if ($Granularity) { $dataSet["granularity"] = $Granularity }
   if ($Filters) { $dataSet.configuration["filters"] = $Filters }
+  if ($dataSet.configuration.Count -eq 0) { $dataSet.Remove("configuration") }
 
   return @{
     location = $Location
