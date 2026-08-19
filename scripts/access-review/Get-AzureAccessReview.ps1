@@ -69,6 +69,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+foreach ($requiredModule in "Az.Accounts", "Az.Resources", "Az.Storage", "ImportExcel") {
+  if (-not (Get-Module -ListAvailable -Name $requiredModule)) {
+    throw "Required module '$requiredModule' is not installed in this PowerShell session ($($PSVersionTable.PSVersion), $($PSVersionTable.PSEdition)). Install it with: Install-Module -Name $requiredModule -Scope CurrentUser"
+  }
+  Import-Module -Name $requiredModule -ErrorAction Stop
+}
+
 if ($UseManagedIdentity) {
   Connect-AzAccount -Identity | Out-Null
 }
