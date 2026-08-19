@@ -189,6 +189,14 @@ Via the portal (Cost Management > Exports at the relevant scope) or
   provided the caller has `Microsoft.Authorization/roleAssignments/delete`
   -- otherwise it must be removed manually.
 
+## Related: monthly Azure access review
+
+This repo also hosts a second, related automation: a monthly Azure RBAC
+access review workbook, delivered into the same storage account via an
+Azure Automation runbook (Cost Management can't schedule this natively --
+it's not a Cost Management dataset). See
+[scripts/access-review/README.md](scripts/access-review/README.md).
+
 ## Known limitations (from the tutorial)
 
 - Management group scope: EA only, usage/actual-cost data only -- no
