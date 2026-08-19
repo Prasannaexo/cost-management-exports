@@ -22,8 +22,8 @@ audit):
   - "Group: <X>" columns: plain Entra group membership, independent of
     whether that group currently carries any role. The column set is
     whatever groups the discovered users actually belong to, discovered
-    dynamically (one pass over every group's member list) rather than
-    hardcoded, so it adapts as groups are renamed/added.
+    dynamically rather than hardcoded, so it adapts as groups are
+    renamed/added.
   - Rows are Entra user objects only. Role assignments held by service
     principals or managed identities are excluded from the per-user sheets
     entirely -- counted and reported in a console summary instead so
@@ -35,8 +35,14 @@ audit):
     script assumes member objects expose .UserPrincipalName and
     .DisplayName directly. Confirm that's true against this tenant's Az
     module version on the first real run -- if it isn't, member UPNs will
-    silently come back empty and those users will be skipped (a warning is
-    printed per skipped assignment either way).
+    silently come back empty and those users will be skipped.
+
+Performance: group membership is tenant-wide, not per-subscription, so it's
+resolved ONCE (a single pass over every Entra group) and reused for both
+(a) expanding group-based role assignments to member users and (b) the
+"Group: X" membership columns, across all three subscriptions. An earlier
+version of this script re-resolved it separately per subscription (3x the
+Graph calls) -- don't reintroduce that.
 
 Requires: Az.Accounts, Az.Resources, Az.Storage, ImportExcel.
 
@@ -67,6 +73,27 @@ if ($UseManagedIdentity) {
   Connect-AzAccount -Identity | Out-Null
 }
 
+# --- Tenant-wide group membership index (built once, reused everywhere) ---
+
+Write-Output "Building tenant-wide group membership index (one pass over every Entra group)..."
+$allGroups = Get-AzADGroup
+Write-Output "  $($allGroups.Count) groups found. Resolving members..."
+
+$groupMembersById = @{}  # GroupObjectId -> array of member objects (User only)
+$groupNameById    = @{}  # GroupObjectId -> DisplayName
+$i = 0
+foreach ($g in $allGroups) {
+  $i++
+  if ($i % 25 -eq 0 -or $i -eq $allGroups.Count) {
+    Write-Output "  ...$i / $($allGroups.Count) groups resolved"
+  }
+  $groupNameById[$g.Id] = $g.DisplayName
+  $groupMembersById[$g.Id] = @(Get-AzADGroupMember -GroupObjectId $g.Id -ErrorAction SilentlyContinue |
+    Where-Object { $_.UserPrincipalName })
+}
+
+# --- Per-subscription role assignment collection ---
+
 function Get-SubscriptionAccessRows {
   param([string]$SubscriptionId, [string]$Label)
 
@@ -79,7 +106,6 @@ function Get-SubscriptionAccessRows {
   $assignments = Get-AzRoleAssignment
 
   $userRows = @{}       # UPN -> ordered hashtable of columns
-  $groupMemberCache = @{}  # GroupObjectId -> cached member list
   $otherCount = 0
 
   function Get-OrCreateUserRow {
@@ -97,16 +123,12 @@ function Get-SubscriptionAccessRows {
         $row["Role: $($a.RoleDefinitionName)"] = "Yes"
       }
       "Group" {
-        if (-not $groupMemberCache.ContainsKey($a.ObjectId)) {
-          try {
-            $groupMemberCache[$a.ObjectId] = @(Get-AzADGroupMember -GroupObjectId $a.ObjectId -ErrorAction Stop)
-          } catch {
-            Write-Warning "Could not expand group $($a.DisplayName) ($($a.ObjectId)): $_"
-            $groupMemberCache[$a.ObjectId] = @()
-          }
+        $members = $groupMembersById[$a.ObjectId]
+        if (-not $members) {
+          Write-Warning "Group $($a.DisplayName) ($($a.ObjectId)) holds role $($a.RoleDefinitionName) but wasn't in the tenant group index -- skipped (may have been deleted since the index was built)."
+          continue
         }
-        foreach ($m in $groupMemberCache[$a.ObjectId]) {
-          if (-not $m.UserPrincipalName) { continue }  # skip nested groups/service principals in membership
+        foreach ($m in $members) {
           $row = Get-OrCreateUserRow -Upn $m.UserPrincipalName -DisplayName $m.DisplayName
           $row["Role: $($a.RoleDefinitionName)"] = "Yes"
         }
@@ -117,16 +139,13 @@ function Get-SubscriptionAccessRows {
 
   Write-Output "  $($userRows.Count) distinct users, $otherCount service-principal/other assignments excluded from rows."
 
-  # Group membership columns: one pass over every group's member list,
-  # building a reverse index, instead of checking membership per-user
-  # (which would be O(users x groups) Graph calls against the full tenant).
-  Write-Output "  Resolving group memberships for discovered users..."
-  $allGroups = Get-AzADGroup
-  foreach ($g in $allGroups) {
-    $members = Get-AzADGroupMember -GroupObjectId $g.Id -ErrorAction SilentlyContinue |
-      Where-Object { $_.UserPrincipalName -and $userRows.ContainsKey($_.UserPrincipalName) }
-    foreach ($m in $members) {
-      $userRows[$m.UserPrincipalName]["Group: $($g.DisplayName)"] = "Yes"
+  # Group membership columns: pure in-memory lookup against the index built
+  # above -- no additional Graph calls.
+  foreach ($groupId in $groupMembersById.Keys) {
+    foreach ($m in $groupMembersById[$groupId]) {
+      if ($userRows.ContainsKey($m.UserPrincipalName)) {
+        $userRows[$m.UserPrincipalName]["Group: $($groupNameById[$groupId])"] = "Yes"
+      }
     }
   }
 
