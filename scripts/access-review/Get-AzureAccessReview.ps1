@@ -31,11 +31,28 @@ audit):
   - "Role Definitions" sheet only lists roles actually observed in use
     across the three subscriptions, not the full built-in Azure role
     catalog.
-  - Get-AzADGroupMember returns a generic directory-object type; this
-    script assumes member objects expose .UserPrincipalName and
-    .DisplayName directly. Confirm that's true against this tenant's Az
-    module version on the first real run -- if it isn't, member UPNs will
-    silently come back empty and those users will be skipped.
+  - Get-AzADGroupMember returns a generic directory-object type; member
+    objects may expose .UserPrincipalName/.DisplayName directly or only
+    under .AdditionalProperties depending on Az.Resources version --
+    Get-MemberUpnAndName below checks both.
+
+KNOWN LIMITATION (confirmed against this tenant, not just theoretical):
+Entra groups marked "assignable to Azure roles" -- which includes every
+BDECompute-Platform-*/BDECompute-*-SuperAdmins group used to grant
+Owner/Contributor/AcrPush and most Key Vault/Storage roles -- return ZERO
+members from Get-AzADGroupMember, even for a caller with full admin rights.
+This is a Microsoft Graph restriction on the calling application's
+permission scope for role-assignable groups, not a bug in this script or a
+permissions gap on the user running it. Ordinary (non-role-assignable)
+groups resolve members fine. Practical effect: anyone whose elevated access
+comes ONLY through a role-assignable group won't show that role in the
+report -- only directly-assigned roles and ordinary-group-derived roles are
+reliable right now. The generated workbook includes a "READ ME -
+Limitations" sheet stating this. Fix (not yet applied): grant the
+reporting identity's Microsoft Graph permissions the
+RoleManagement.Read.Directory scope, which is specifically for reading
+role-assignable group membership -- GroupMember.Read.All and
+User.Read.All are not sufficient for these groups.
 
 Performance: group membership is tenant-wide, not per-subscription, so it's
 resolved ONCE (a single pass over every Entra group) and reused for both
@@ -228,8 +245,21 @@ $roleDefRows = foreach ($roleName in $observedRoleNames) {
   }
 }
 
+$emptyGroupCount = @($groupMembersById.Values | Where-Object { $_.Count -eq 0 }).Count
+$limitationsNote = @(
+  [pscustomobject]@{ Note = "KNOWN LIMITATION -- read before relying on this report for an access decision." }
+  [pscustomobject]@{ Note = "" }
+  [pscustomobject]@{ Note = "Roles granted via Entra groups marked 'assignable to Azure roles' (e.g. the BDECompute-Platform-* / BDECompute-*-SuperAdmins groups used to grant Owner, Contributor, AcrPush, and most Key Vault/Storage roles) are NOT reflected below." }
+  [pscustomobject]@{ Note = "Confirmed cause: Microsoft Graph restricts membership visibility for role-assignable groups beyond normal group-read permissions -- Get-AzADGroupMember returns zero members for these groups even for an account with full admin rights, because the restriction applies to the calling application's Graph permission scope, not the signed-in user's own access." }
+  [pscustomobject]@{ Note = "Of $($allGroups.Count) Entra groups scanned, $emptyGroupCount returned zero resolvable members -- some of those are genuinely empty non-RBAC groups, but this includes every BDECompute-* role-assignable group checked so far." }
+  [pscustomobject]@{ Note = "What IS reliable below: roles assigned directly to individual users, and membership in ordinary (non-role-assignable) groups." }
+  [pscustomobject]@{ Note = "What's missing: anyone whose Owner/Contributor/AcrPush/etc. access comes ONLY through a role-assignable group membership will not appear with that role in this report." }
+  [pscustomobject]@{ Note = "Fix path (not yet applied): grant the reporting identity the Microsoft Graph RoleManagement.Read.Directory permission, which is scoped specifically to reading role-assignable group membership." }
+)
+
 Write-Output "Writing workbook to $OutputPath..."
 Remove-Item -Path $OutputPath -ErrorAction SilentlyContinue
+$limitationsNote | Export-Excel -Path $OutputPath -WorksheetName "READ ME - Limitations" -AutoSize -NoHeader
 $prodRows    | Export-Excel -Path $OutputPath -WorksheetName "Production" -AutoSize -FreezeTopRow -BoldTopRow
 $testRows    | Export-Excel -Path $OutputPath -WorksheetName "Test" -AutoSize -FreezeTopRow -BoldTopRow
 $devRows     | Export-Excel -Path $OutputPath -WorksheetName "Dev" -AutoSize -FreezeTopRow -BoldTopRow

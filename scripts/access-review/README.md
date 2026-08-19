@@ -10,9 +10,21 @@ workbook (`260804 AR PK azure access review.xlsx`) that had sheets for
 Production, Test, Dev, an "All Subscriptions" rollup, and a "Role
 Definitions" reference. See the methodology notes at the top of
 [Get-AzureAccessReview.ps1](Get-AzureAccessReview.ps1) for exactly how role
-and group membership are attributed to each user -- verify that logic
-against a real run before treating the output as an authoritative audit
-record.
+and group membership are attributed to each user.
+
+**Known gap, confirmed against this tenant (not just a theoretical risk):**
+roles granted via Entra groups marked "assignable to Azure roles" --
+every `BDECompute-Platform-*`/`BDECompute-*-SuperAdmins` group, which
+carry most of the Owner/Contributor/AcrPush/Key Vault/Storage role grants
+-- do not show up. `Get-AzADGroupMember` returns zero members for these
+groups regardless of the caller's own admin rights, because Microsoft
+Graph restricts membership visibility for role-assignable groups at the
+calling-application permission-scope level, separate from the user's own
+directory role. Ordinary groups and directly-assigned user roles resolve
+correctly. The generated workbook includes a "READ ME - Limitations"
+sheet stating this so it isn't mistaken for a complete picture. See
+"Closing the group-membership gap" below for the actual fix, which hasn't
+been applied yet.
 
 ## Why an Azure Automation runbook instead of Cost Management's native scheduling
 
@@ -54,7 +66,26 @@ Administrator) to actually carry out:
 2. **Grant the managed identity Microsoft Graph application permissions**
    (`GroupMember.Read.All`, `User.Read.All`) so it can expand group
    membership -- see the exact `New-MgServicePrincipalAppRoleAssignment`
-   commands printed at the end of `New-AccessReviewAutomation.ps1`.
+   commands printed at the end of `New-AccessReviewAutomation.ps1`. Note:
+   as of this writing these two are NOT sufficient to read role-assignable
+   group membership -- see "Closing the group-membership gap" below.
+
+## Closing the group-membership gap (not yet done)
+
+To actually see roles granted via `BDECompute-*` groups, the reporting
+identity's Graph permissions need `RoleManagement.Read.Directory` in
+addition to `GroupMember.Read.All`/`User.Read.All` -- that scope is
+specifically for reading role-assignable group membership, which is
+otherwise restricted regardless of the caller's own directory role. This
+requires a Global Administrator or Privileged Role Administrator to grant,
+same as the other Graph permissions. Whether this alone fully resolves it
+hasn't been confirmed -- test against one known role-assignable group
+after granting it, the same way the current gap was confirmed:
+```powershell
+Get-AzADGroupMember -GroupObjectId "<a BDECompute-* group's object ID>" | Select-Object DisplayName, Id
+```
+If members show up now, re-run the report and the "READ ME - Limitations"
+sheet's group count should drop.
 
 ## Testing before the schedule fires
 
