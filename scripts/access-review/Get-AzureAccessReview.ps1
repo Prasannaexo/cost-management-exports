@@ -82,21 +82,45 @@ if ($UseManagedIdentity) {
 
 # --- Tenant-wide group membership index (built once, reused everywhere) ---
 
-Write-Output "Building tenant-wide group membership index (one pass over every Entra group)..."
-$allGroups = Get-AzADGroup
-Write-Output "  $($allGroups.Count) groups found. Resolving members..."
+function Get-MemberUpnAndName {
+  # Get-AzADGroupMember's return type varies by Az.Resources version -- some
+  # expose .UserPrincipalName/.DisplayName directly, others only populate
+  # .AdditionalProperties['userPrincipalName']/['displayName']. Check both so
+  # membership resolution doesn't silently come back empty on a version
+  # where the flat properties aren't populated.
+  param($Member)
+  $upn = $Member.UserPrincipalName
+  if (-not $upn -and $Member.AdditionalProperties -and $Member.AdditionalProperties.ContainsKey('userPrincipalName')) {
+    $upn = $Member.AdditionalProperties['userPrincipalName']
+  }
+  $name = $Member.DisplayName
+  if (-not $name -and $Member.AdditionalProperties -and $Member.AdditionalProperties.ContainsKey('displayName')) {
+    $name = $Member.AdditionalProperties['displayName']
+  }
+  if (-not $upn) { return $null }
+  return [pscustomobject]@{ UserPrincipalName = $upn; DisplayName = $name }
+}
 
-$groupMembersById = @{}  # GroupObjectId -> array of member objects (User only)
+Write-Host "Building tenant-wide group membership index (one pass over every Entra group)..."
+$allGroups = Get-AzADGroup
+Write-Host "  $($allGroups.Count) groups found. Resolving members..."
+
+$groupMembersById = @{}  # GroupObjectId -> array of normalized {UserPrincipalName, DisplayName} objects
 $groupNameById    = @{}  # GroupObjectId -> DisplayName
 $i = 0
 foreach ($g in $allGroups) {
   $i++
   if ($i % 25 -eq 0 -or $i -eq $allGroups.Count) {
-    Write-Output "  ...$i / $($allGroups.Count) groups resolved"
+    Write-Host "  ...$i / $($allGroups.Count) groups resolved"
   }
   $groupNameById[$g.Id] = $g.DisplayName
-  $groupMembersById[$g.Id] = @(Get-AzADGroupMember -GroupObjectId $g.Id -ErrorAction SilentlyContinue |
-    Where-Object { $_.UserPrincipalName })
+  $rawMembers = Get-AzADGroupMember -GroupObjectId $g.Id -ErrorAction SilentlyContinue
+  $groupMembersById[$g.Id] = @($rawMembers | ForEach-Object { Get-MemberUpnAndName $_ } | Where-Object { $_ })
+}
+
+$totalResolvedMembers = ($groupMembersById.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+if ($totalResolvedMembers -eq 0 -and $allGroups.Count -gt 0) {
+  Write-Warning "Zero group members resolved across $($allGroups.Count) groups -- Get-AzADGroupMember's return shape may not match what this script expects in this Az.Resources version, or these groups are genuinely all empty. Group-based role attribution and 'Group:' columns will be empty in the report. Verify with: Get-AzADGroupMember -GroupObjectId <id> | Format-List *"
 }
 
 # --- Per-subscription role assignment collection ---
@@ -104,7 +128,12 @@ foreach ($g in $allGroups) {
 function Get-SubscriptionAccessRows {
   param([string]$SubscriptionId, [string]$Label)
 
-  Write-Output "Collecting role assignments for $Label ($SubscriptionId)..."
+  # Write-Host, not Write-Output: this function's result is captured into a
+  # variable by the caller ($prodRows = Get-SubscriptionAccessRows ...), and
+  # PowerShell functions return everything written to the success stream --
+  # Write-Output here would silently prepend these status strings onto the
+  # actual row data, corrupting the Excel output. Write-Host bypasses that.
+  Write-Host "Collecting role assignments for $Label ($SubscriptionId)..."
   Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 
   # No -Scope filter: returns every assignment across every resource in the
@@ -130,10 +159,13 @@ function Get-SubscriptionAccessRows {
         $row["Role: $($a.RoleDefinitionName)"] = "Yes"
       }
       "Group" {
-        $members = $groupMembersById[$a.ObjectId]
-        if (-not $members) {
+        if (-not $groupMembersById.ContainsKey($a.ObjectId)) {
           Write-Warning "Group $($a.DisplayName) ($($a.ObjectId)) holds role $($a.RoleDefinitionName) but wasn't in the tenant group index -- skipped (may have been deleted since the index was built)."
           continue
+        }
+        $members = $groupMembersById[$a.ObjectId]
+        if ($members.Count -eq 0) {
+          Write-Warning "Group $($a.DisplayName) ($($a.ObjectId)) holds role $($a.RoleDefinitionName) but resolved to zero members -- either genuinely empty, or Get-AzADGroupMember's return shape didn't match (see the warning printed during index building, if any)."
         }
         foreach ($m in $members) {
           $row = Get-OrCreateUserRow -Upn $m.UserPrincipalName -DisplayName $m.DisplayName
@@ -144,7 +176,7 @@ function Get-SubscriptionAccessRows {
     }
   }
 
-  Write-Output "  $($userRows.Count) distinct users, $otherCount service-principal/other assignments excluded from rows."
+  Write-Host "  $($userRows.Count) distinct users, $otherCount service-principal/other assignments excluded from rows."
 
   # Group membership columns: pure in-memory lookup against the index built
   # above -- no additional Graph calls.
