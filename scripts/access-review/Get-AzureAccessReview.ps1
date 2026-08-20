@@ -245,6 +245,11 @@ function Get-SubscriptionAccessRows {
   if ($assignments.Count -eq 0) {
     Write-Warning "Zero role assignments returned for $Label ($SubscriptionId). If this subscription has any RBAC assignments at all (nearly all do -- Owner/Contributor/etc. at minimum), this points to a permission or context problem for the identity running this script, not a genuinely empty subscription."
   }
+  Write-Verbose "  Distinct role names in raw assignments for $Label`: $(($assignments | Select-Object -ExpandProperty RoleDefinitionName -Unique) -join ', ')" -Verbose
+  $knownUserAssignments = @($assignments | Where-Object { $_.ObjectId -eq "10365227-109f-4439-953c-41c6d58bfeaa" })
+  if ($knownUserAssignments.Count -gt 0) {
+    Write-Verbose "  Raw assignments for known-user ObjectId 10365227... in $Label`: $(($knownUserAssignments | ForEach-Object { $_.RoleDefinitionName }) -join ' | ')" -Verbose
+  }
 
   $userRows = @{}       # UPN -> ordered hashtable of columns
   $otherCount = 0
@@ -323,6 +328,11 @@ function Get-SubscriptionAccessRows {
   if ($otherCount -gt 0) {
     Write-Verbose "  Sample of excluded assignments (up to 5), full property dump:" -Verbose
     $otherSamples | ForEach-Object { Write-Verbose "    $_" -Verbose }
+  }
+  $knownUserUpn = ($userLookupCache.Values | Where-Object { $_ -and $_.UserPrincipalName -like "pkbiswal@*" } | Select-Object -First 1).UserPrincipalName
+  if ($knownUserUpn -and $userRows.ContainsKey($knownUserUpn)) {
+    $rowDump = ($userRows[$knownUserUpn].Keys | ForEach-Object { "$_=$($userRows[$knownUserUpn][$_])" }) -join "; "
+    Write-Verbose "  Final row contents for $knownUserUpn`: $rowDump" -Verbose
   }
 
   # Group membership columns: pure in-memory lookup against the indexes built
