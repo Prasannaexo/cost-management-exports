@@ -106,6 +106,14 @@ Import-AzAutomationRunbook -ResourceGroupName $ResourceGroupName -AutomationAcco
 Publish-AzAutomationRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
   -Name $RunbookName | Out-Null
 
+# Azure Automation does not capture the Information stream (Write-Host) at
+# all -- confirmed the hard way, none of the runbook's progress messages
+# showed up in job logs until this was enabled and the script switched to
+# Write-Verbose. Without -LogVerbose, diagnosing a "job completed but the
+# report is empty" run is nearly impossible.
+Set-AzAutomationRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
+  -Name $RunbookName -LogVerbose $true -LogProgress $true | Out-Null
+
 Write-Host "Creating monthly schedule..." -ForegroundColor Cyan
 $scheduleName = "monthly-1st-06utc"
 $nextMonthStart = (Get-Date -Day 1).AddMonths(1).Date.AddHours(6)  # 1st of next month, 06:00 UTC

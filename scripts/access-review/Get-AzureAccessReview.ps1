@@ -121,9 +121,9 @@ function Get-MemberUpnAndName {
   return [pscustomobject]@{ UserPrincipalName = $upn; DisplayName = $name }
 }
 
-Write-Host "Building tenant-wide group membership index (one pass over every Entra group)..."
+Write-Verbose "Building tenant-wide group membership index (one pass over every Entra group)..." -Verbose
 $allGroups = Get-AzADGroup
-Write-Host "  $($allGroups.Count) groups found. Resolving members..."
+Write-Verbose "  $($allGroups.Count) groups found. Resolving members..." -Verbose
 
 $groupMembersById = @{}  # GroupObjectId -> array of normalized {UserPrincipalName, DisplayName} objects, ACTIVE members
 $groupNameById    = @{}  # GroupObjectId -> DisplayName
@@ -131,7 +131,7 @@ $i = 0
 foreach ($g in $allGroups) {
   $i++
   if ($i % 25 -eq 0 -or $i -eq $allGroups.Count) {
-    Write-Host "  ...$i / $($allGroups.Count) groups resolved"
+    Write-Verbose "  ...$i / $($allGroups.Count) groups resolved" -Verbose
   }
   $groupNameById[$g.Id] = $g.DisplayName
   $rawMembers = Get-AzADGroupMember -GroupObjectId $g.Id -ErrorAction SilentlyContinue
@@ -168,7 +168,7 @@ function Get-GraphBearerToken {
   return $tokenObj.Token
 }
 
-Write-Host "Checking PIM-eligible group membership (requires PrivilegedAccess.Read.AzureADGroup)..."
+Write-Verbose "Checking PIM-eligible group membership (requires PrivilegedAccess.Read.AzureADGroup)..." -Verbose
 try {
   $graphHeaders = @{ Authorization = "Bearer $(Get-GraphBearerToken)" }
   # No $expand=principal here -- that combination 400'd against this endpoint.
@@ -205,7 +205,7 @@ try {
     $groupEligibleMembersById[$groupId] = $resolved
   }
   $eligibleCount = ($groupEligibleMembersById.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-  Write-Host "  PIM eligibility data available -- $eligibleCount eligible user assignments found across $($groupEligibleMembersById.Keys.Count) groups."
+  Write-Verbose "  PIM eligibility data available -- $eligibleCount eligible user assignments found across $($groupEligibleMembersById.Keys.Count) groups." -Verbose
 } catch {
   $pimAvailable = $false
   $pimErrorMessage = $_.Exception.Message
@@ -217,12 +217,17 @@ try {
 function Get-SubscriptionAccessRows {
   param([string]$SubscriptionId, [string]$Label)
 
-  # Write-Host, not Write-Output: this function's result is captured into a
-  # variable by the caller ($prodRows = Get-SubscriptionAccessRows ...), and
-  # PowerShell functions return everything written to the success stream --
-  # Write-Output here would silently prepend these status strings onto the
-  # actual row data, corrupting the Excel output. Write-Host bypasses that.
-  Write-Host "Collecting role assignments for $Label ($SubscriptionId)..."
+  # Write-Verbose (with -Verbose to force it on regardless of caller
+  # preference), not Write-Output/Write-Host: this function's result is
+  # captured into a variable by the caller ($prodRows = Get-SubscriptionAccessRows
+  # ...), and PowerShell functions return everything written to the success
+  # stream -- Write-Output here would silently prepend these status strings
+  # onto the actual row data, corrupting the Excel output. Write-Host avoids
+  # that but Azure Automation doesn't capture the Information stream it uses
+  # at all (confirmed: none of these messages appeared in the job's logs) --
+  # Verbose is captured, provided the runbook has logVerbose enabled (see
+  # New-AccessReviewAutomation.ps1 / Set-AzAutomationRunbook -LogVerbose $true).
+  Write-Verbose "Collecting role assignments for $Label ($SubscriptionId)..." -Verbose
   $context = Set-AzContext -SubscriptionId $SubscriptionId
   if (-not $context -or $context.Subscription.Id -ne $SubscriptionId) {
     throw "Set-AzContext did not switch to subscription $SubscriptionId for $Label -- got '$($context.Subscription.Id)' instead. Aborting rather than silently reporting the wrong (or no) subscription's data."
@@ -236,7 +241,7 @@ function Get-SubscriptionAccessRows {
   } catch {
     throw "Get-AzRoleAssignment failed for $Label ($SubscriptionId): $_"
   }
-  Write-Host "  Get-AzRoleAssignment returned $($assignments.Count) assignment(s) for $Label."
+  Write-Verbose "  Get-AzRoleAssignment returned $($assignments.Count) assignment(s) for $Label." -Verbose
   if ($assignments.Count -eq 0) {
     Write-Warning "Zero role assignments returned for $Label ($SubscriptionId). If this subscription has any RBAC assignments at all (nearly all do -- Owner/Contributor/etc. at minimum), this points to a permission or context problem for the identity running this script, not a genuinely empty subscription."
   }
@@ -289,7 +294,7 @@ function Get-SubscriptionAccessRows {
     }
   }
 
-  Write-Host "  $($userRows.Count) distinct users, $otherCount service-principal/other assignments excluded from rows."
+  Write-Verbose "  $($userRows.Count) distinct users, $otherCount service-principal/other assignments excluded from rows." -Verbose
 
   # Group membership columns: pure in-memory lookup against the indexes built
   # above -- no additional Graph calls. Active membership takes precedence
