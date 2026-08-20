@@ -419,14 +419,40 @@ $limitationsNote = @(
   [pscustomobject]@{ Note = "Nested group membership (a group added as a member of another group) is not expanded -- only direct members/eligible principals are resolved." }
 )
 
+function ConvertTo-UniformRows {
+  # Export-Excel derives its column headers from the FIRST object in the
+  # piped collection. Since each user's set of Role:/Group: properties
+  # depends on what they individually hold, later objects routinely have
+  # properties the first one doesn't -- and Export-Excel silently drops
+  # those from the output. Confirmed the hard way: a user's in-memory row
+  # had 28 roles, only 3 made it into the exported sheet, because whichever
+  # user happened to be first in hashtable enumeration order only held 3.
+  # Normalize every object to the same full property set (the union across
+  # all of them) before anything gets exported.
+  param([object[]]$Rows)
+  if ($Rows.Count -eq 0) { return ,@() }
+  $allKeys = [ordered]@{}
+  foreach ($r in $Rows) {
+    foreach ($p in $r.PSObject.Properties) { $allKeys[$p.Name] = $true }
+  }
+  return ,@($Rows | ForEach-Object {
+    $src = $_
+    $h = [ordered]@{}
+    foreach ($k in $allKeys.Keys) {
+      $h[$k] = if ($src.PSObject.Properties.Name -contains $k) { $src.$k } else { $null }
+    }
+    [pscustomobject]$h
+  })
+}
+
 Write-Output "Writing workbook to $OutputPath..."
 Remove-Item -Path $OutputPath -ErrorAction SilentlyContinue
 $limitationsNote | Export-Excel -Path $OutputPath -WorksheetName "READ ME - Limitations" -AutoSize -NoHeader
-$prodRows    | Export-Excel -Path $OutputPath -WorksheetName "Production" -AutoSize -FreezeTopRow -BoldTopRow
-$testRows    | Export-Excel -Path $OutputPath -WorksheetName "Test" -AutoSize -FreezeTopRow -BoldTopRow
-$devRows     | Export-Excel -Path $OutputPath -WorksheetName "Dev" -AutoSize -FreezeTopRow -BoldTopRow
-$allRows     | Export-Excel -Path $OutputPath -WorksheetName "All Subscriptions" -AutoSize -FreezeTopRow -BoldTopRow
-$roleDefRows | Export-Excel -Path $OutputPath -WorksheetName "Role Definitions" -AutoSize -FreezeTopRow -BoldTopRow
+(ConvertTo-UniformRows $prodRows) | Export-Excel -Path $OutputPath -WorksheetName "Production" -AutoSize -FreezeTopRow -BoldTopRow
+(ConvertTo-UniformRows $testRows) | Export-Excel -Path $OutputPath -WorksheetName "Test" -AutoSize -FreezeTopRow -BoldTopRow
+(ConvertTo-UniformRows $devRows)  | Export-Excel -Path $OutputPath -WorksheetName "Dev" -AutoSize -FreezeTopRow -BoldTopRow
+(ConvertTo-UniformRows $allRows)  | Export-Excel -Path $OutputPath -WorksheetName "All Subscriptions" -AutoSize -FreezeTopRow -BoldTopRow
+(ConvertTo-UniformRows $roleDefRows) | Export-Excel -Path $OutputPath -WorksheetName "Role Definitions" -AutoSize -FreezeTopRow -BoldTopRow
 
 Write-Output "Uploading to storage..."
 $storageAccountName = ($StorageAccountResourceId -split "/")[-1]
