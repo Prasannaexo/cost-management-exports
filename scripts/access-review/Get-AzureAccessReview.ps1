@@ -258,24 +258,34 @@ function Get-SubscriptionAccessRows {
     return $userRows[$Upn]
   }
 
+  # Neither ObjectType nor SignInName can be trusted here: confirmed via a
+  # real run that both come back empty/"Unknown" for every assignment when
+  # this script runs as the Automation Account's managed identity --
+  # including for a role assignment we independently confirmed belongs to
+  # a real user (SignInName was blank for it too, not just for genuine
+  # service principals). Classify by explicit lookup instead: an ObjectId
+  # matching the tenant group index built earlier is a group; anything else
+  # gets a one-time (cached) Get-AzADUser lookup to determine if it's a
+  # real user or a genuine service principal/managed identity to exclude.
+  $userLookupCache = @{}  # ObjectId -> resolved {UserPrincipalName, DisplayName} or $null if not a user
+
   foreach ($a in $assignments) {
-    # Deliberately NOT switching on $a.ObjectType: confirmed via a real run
-    # that when this script runs as the Automation Account's managed
-    # identity, ObjectType comes back as something other than the clean
-    # "User"/"Group" strings it returns for an interactive user session
-    # (every one of 295+252+84 assignments landed in "other" this way,
-    # despite the same subscriptions showing 493+ users when run
-    # interactively). Classify using signals resolved independently instead:
-    # a populated SignInName means a user (Get-AzRoleAssignment always
-    # resolves this for user principals); an ObjectId matching the tenant
-    # group index built earlier means a group. Both are more reliable here
-    # than trusting ObjectType's exact value.
-    if ($a.SignInName) {
+    if (-not $userLookupCache.ContainsKey($a.ObjectId) -and -not $groupNameById.ContainsKey($a.ObjectId)) {
+      try {
+        $u = Get-AzADUser -ObjectId $a.ObjectId -ErrorAction Stop
+        $userLookupCache[$a.ObjectId] = [pscustomobject]@{ UserPrincipalName = $u.UserPrincipalName; DisplayName = $u.DisplayName }
+      } catch {
+        $userLookupCache[$a.ObjectId] = $null  # genuinely not a user -- service principal/managed identity
+      }
+    }
+
+    if ($userLookupCache.ContainsKey($a.ObjectId) -and $userLookupCache[$a.ObjectId]) {
       # Get-AzRoleAssignment only ever returns ACTIVE assignments -- a
       # directly-assigned role that's PIM-eligible-but-not-activated
       # wouldn't appear here at all (a separate, narrower gap than the
       # group-eligibility one this script now covers; not yet handled).
-      $row = Get-OrCreateUserRow -Upn $a.SignInName -DisplayName $a.DisplayName
+      $u = $userLookupCache[$a.ObjectId]
+      $row = Get-OrCreateUserRow -Upn $u.UserPrincipalName -DisplayName $u.DisplayName
       $row["Role: $($a.RoleDefinitionName)"] = "Active"
     } elseif ($groupNameById.ContainsKey($a.ObjectId)) {
       $activeMembers = $groupMembersById[$a.ObjectId]
