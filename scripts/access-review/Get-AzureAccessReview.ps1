@@ -248,6 +248,7 @@ function Get-SubscriptionAccessRows {
 
   $userRows = @{}       # UPN -> ordered hashtable of columns
   $otherCount = 0
+  $otherSamples = @()   # up to 5 full property dumps of unmatched assignments, for diagnosing classification misses
 
   function Get-OrCreateUserRow {
     param([string]$Upn, [string]$DisplayName)
@@ -297,12 +298,22 @@ function Get-SubscriptionAccessRows {
     } else {
       # Neither a resolvable user nor a group in our tenant-wide index --
       # genuinely a service principal/managed identity, or a group that was
-      # deleted since the index was built at the top of this script.
+      # deleted since the index was built at the top of this script. Sample
+      # the first few so we can see exactly what's actually in these
+      # objects if this count looks too high -- ObjectType/ObjectId have
+      # both turned out to be unreliable in this identity context before.
       $otherCount++
+      if ($otherSamples.Count -lt 5) {
+        $otherSamples += ($a.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join "; "
+      }
     }
   }
 
   Write-Verbose "  $($userRows.Count) distinct users, $otherCount service-principal/other assignments excluded from rows." -Verbose
+  if ($otherCount -gt 0) {
+    Write-Verbose "  Sample of excluded assignments (up to 5), full property dump:" -Verbose
+    $otherSamples | ForEach-Object { Write-Verbose "    $_" -Verbose }
+  }
 
   # Group membership columns: pure in-memory lookup against the indexes built
   # above -- no additional Graph calls. Active membership takes precedence
