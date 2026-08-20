@@ -12,19 +12,22 @@ Definitions" reference. See the methodology notes at the top of
 [Get-AzureAccessReview.ps1](Get-AzureAccessReview.ps1) for exactly how role
 and group membership are attributed to each user.
 
-**Known gap, confirmed against this tenant (not just a theoretical risk):**
-roles granted via Entra groups marked "assignable to Azure roles" --
-every `BDECompute-Platform-*`/`BDECompute-*-SuperAdmins` group, which
-carry most of the Owner/Contributor/AcrPush/Key Vault/Storage role grants
--- do not show up. `Get-AzADGroupMember` returns zero members for these
-groups regardless of the caller's own admin rights, because Microsoft
-Graph restricts membership visibility for role-assignable groups at the
-calling-application permission-scope level, separate from the user's own
-directory role. Ordinary groups and directly-assigned user roles resolve
-correctly. The generated workbook includes a "READ ME - Limitations"
-sheet stating this so it isn't mistaken for a complete picture. See
-"Closing the group-membership gap" below for the actual fix, which hasn't
-been applied yet.
+**Group membership note, confirmed against this tenant:** groups like
+`BDECompute-Platform-SuperAdmins-Prod` initially appeared to have zero
+members at all, which looked like a permissions bug. It isn't one --
+confirmed via a direct Graph query that the group is NOT a
+role-assignable group (`isAssignableToRole: false`). The real cause is
+PIM: these admin groups use "eligible" (just-in-time) membership rather
+than standing membership, so nobody is a permanent member and a plain
+membership query genuinely finds nobody active most of the time. The
+script now separately queries PIM eligibility schedules and marks those
+users **"Eligible"** in the report (vs **"Active"** for real, current
+access) -- see the methodology notes in
+[Get-AzureAccessReview.ps1](Get-AzureAccessReview.ps1). This needs one
+additional Graph permission the reporting identity may not have yet; see
+"Closing the PIM-eligibility gap" below. The generated workbook's
+"READ ME - Limitations" sheet reports, on every run, whether that
+permission was actually available.
 
 ## Why an Azure Automation runbook instead of Cost Management's native scheduling
 
@@ -66,26 +69,44 @@ Administrator) to actually carry out:
 2. **Grant the managed identity Microsoft Graph application permissions**
    (`GroupMember.Read.All`, `User.Read.All`) so it can expand group
    membership -- see the exact `New-MgServicePrincipalAppRoleAssignment`
-   commands printed at the end of `New-AccessReviewAutomation.ps1`. Note:
-   as of this writing these two are NOT sufficient to read role-assignable
-   group membership -- see "Closing the group-membership gap" below.
+   commands printed at the end of `New-AccessReviewAutomation.ps1`.
+3. **Grant one more Graph permission for PIM-eligible group data**:
+   `PrivilegedAccess.Read.AzureADGroup` -- see "Closing the PIM-eligibility
+   gap" below. Without it the report still runs fine, just without
+   "Eligible" rows for PIM-managed admin groups.
 
-## Closing the group-membership gap (not yet done)
+## Closing the PIM-eligibility gap (not yet done)
 
-To actually see roles granted via `BDECompute-*` groups, the reporting
-identity's Graph permissions need `RoleManagement.Read.Directory` in
-addition to `GroupMember.Read.All`/`User.Read.All` -- that scope is
-specifically for reading role-assignable group membership, which is
-otherwise restricted regardless of the caller's own directory role. This
-requires a Global Administrator or Privileged Role Administrator to grant,
-same as the other Graph permissions. Whether this alone fully resolves it
-hasn't been confirmed -- test against one known role-assignable group
-after granting it, the same way the current gap was confirmed:
+To see PIM-eligible (not-yet-activated) membership in admin groups like
+`BDECompute-Platform-SuperAdmins-Prod`, the reporting identity's Graph
+permissions need `PrivilegedAccess.Read.AzureADGroup` in addition to
+`GroupMember.Read.All`/`User.Read.All`. This requires a Global
+Administrator or Privileged Role Administrator to grant, same as the
+other Graph permissions:
+
 ```powershell
-Get-AzADGroupMember -GroupObjectId "<a BDECompute-* group's object ID>" | Select-Object DisplayName, Id
+Connect-MgGraph -Scopes "AppRoleAssignment.ReadWrite.All"
+$graphSpId = (Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'").Id
+$targetSpId = "<the reporting identity's service principal object ID>"
+$appRole = (Get-MgServicePrincipal -ServicePrincipalId $graphSpId).AppRoles |
+  Where-Object { $_.Value -eq "PrivilegedAccess.Read.AzureADGroup" }
+New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $targetSpId -PrincipalId $targetSpId `
+  -ResourceId $graphSpId -AppRoleId $appRole.Id
 ```
-If members show up now, re-run the report and the "READ ME - Limitations"
-sheet's group count should drop.
+
+Verify it worked with the same check used to originally confirm the gap:
+```powershell
+$tokenObj = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com"
+$token = if ($tokenObj.Token -is [securestring]) {
+  [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenObj.Token))
+} else { $tokenObj.Token }
+Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules" -Headers @{ Authorization = "Bearer $token" }
+```
+A 403 means the permission hasn't propagated yet or wasn't granted to the
+right identity; a 200 with data (or an empty `value` array, which is a
+valid "nobody eligible right now" answer) means it worked. Re-run the
+report afterward -- the "READ ME - Limitations" sheet will say "PIM
+eligibility data: AVAILABLE" instead of "NOT AVAILABLE" once it's live.
 
 ## Testing before the schedule fires
 

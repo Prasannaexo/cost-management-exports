@@ -140,12 +140,21 @@ Run this as a Global Admin (PowerShell, Microsoft Graph SDK):
   Connect-MgGraph -Scopes "AppRoleAssignment.ReadWrite.All"
   `$graphSpId = (Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'").Id
   `$miSpId = "$principalId"
-  foreach (`$perm in "GroupMember.Read.All", "User.Read.All") {
+  foreach (`$perm in "GroupMember.Read.All", "User.Read.All", "PrivilegedAccess.Read.AzureADGroup") {
     `$appRole = (Get-MgServicePrincipal -ServicePrincipalId `$graphSpId).AppRoles |
       Where-Object { `$_.Value -eq `$perm }
     New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId `$miSpId -PrincipalId `$miSpId ``
       -ResourceId `$graphSpId -AppRoleId `$appRole.Id
   }
+
+  # PrivilegedAccess.Read.AzureADGroup is what lets the report see PIM
+  # "eligible" (just-in-time) membership in admin groups like
+  # BDECompute-Platform-SuperAdmins-Prod -- without it those groups show
+  # zero members even though people are eligible to activate access into
+  # them. The other two are for ordinary group/user lookups. The report
+  # runs fine without PrivilegedAccess.Read.AzureADGroup, it just won't
+  # show "Eligible" rows for PIM-managed groups (its "READ ME -
+  # Limitations" sheet says so explicitly when this is missing).
 
 Also import these modules into the Automation Account from the portal
 (Automation Account > Modules > Browse gallery) before the first run:

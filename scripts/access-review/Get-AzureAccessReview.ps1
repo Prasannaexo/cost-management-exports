@@ -36,23 +36,26 @@ audit):
     under .AdditionalProperties depending on Az.Resources version --
     Get-MemberUpnAndName below checks both.
 
-KNOWN LIMITATION (confirmed against this tenant, not just theoretical):
-Entra groups marked "assignable to Azure roles" -- which includes every
-BDECompute-Platform-*/BDECompute-*-SuperAdmins group used to grant
-Owner/Contributor/AcrPush and most Key Vault/Storage roles -- return ZERO
-members from Get-AzADGroupMember, even for a caller with full admin rights.
-This is a Microsoft Graph restriction on the calling application's
-permission scope for role-assignable groups, not a bug in this script or a
-permissions gap on the user running it. Ordinary (non-role-assignable)
-groups resolve members fine. Practical effect: anyone whose elevated access
-comes ONLY through a role-assignable group won't show that role in the
-report -- only directly-assigned roles and ordinary-group-derived roles are
-reliable right now. The generated workbook includes a "READ ME -
-Limitations" sheet stating this. Fix (not yet applied): grant the
-reporting identity's Microsoft Graph permissions the
-RoleManagement.Read.Directory scope, which is specifically for reading
-role-assignable group membership -- GroupMember.Read.All and
-User.Read.All are not sufficient for these groups.
+PIM-ELIGIBLE GROUP MEMBERSHIP (confirmed against this tenant -- read this
+before treating an empty admin-group result as "nobody has access"):
+Get-AzADGroupMember only ever sees ACTIVE group membership. Groups like
+BDECompute-Platform-SuperAdmins-Prod initially appeared to have zero
+members entirely -- that was NOT a role-assignable-group permission
+restriction (confirmed via direct Graph query: isAssignableToRole is
+false for that group) and NOT a bug in Get-AzADGroupMember. It's PIM
+"eligible" (just-in-time) group membership by design: nobody is a
+standing member; people activate temporary membership when they need
+elevated access, so a snapshot query genuinely finds nobody active most
+of the time. This script now separately queries PIM eligibility
+schedules (Microsoft Graph identityGovernance/privilegedAccess/group/
+eligibilitySchedules) and merges eligible-but-inactive assignments into
+the report as "Eligible" (vs "Active" for real, current access) --
+see Get-GraphBearerToken and the PIM section below. This requires the
+PrivilegedAccess.Read.AzureADGroup Graph permission; without it, this
+degrades gracefully to active-membership-only (previous behavior) and
+the generated workbook's "READ ME - Limitations" sheet says so
+explicitly, including whether PIM data was actually available on that
+specific run.
 
 Performance: group membership is tenant-wide, not per-subscription, so it's
 resolved ONCE (a single pass over every Entra group) and reused for both
@@ -122,7 +125,7 @@ Write-Host "Building tenant-wide group membership index (one pass over every Ent
 $allGroups = Get-AzADGroup
 Write-Host "  $($allGroups.Count) groups found. Resolving members..."
 
-$groupMembersById = @{}  # GroupObjectId -> array of normalized {UserPrincipalName, DisplayName} objects
+$groupMembersById = @{}  # GroupObjectId -> array of normalized {UserPrincipalName, DisplayName} objects, ACTIVE members
 $groupNameById    = @{}  # GroupObjectId -> DisplayName
 $i = 0
 foreach ($g in $allGroups) {
@@ -138,6 +141,65 @@ foreach ($g in $allGroups) {
 $totalResolvedMembers = ($groupMembersById.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
 if ($totalResolvedMembers -eq 0 -and $allGroups.Count -gt 0) {
   Write-Warning "Zero group members resolved across $($allGroups.Count) groups -- Get-AzADGroupMember's return shape may not match what this script expects in this Az.Resources version, or these groups are genuinely all empty. Group-based role attribution and 'Group:' columns will be empty in the report. Verify with: Get-AzADGroupMember -GroupObjectId <id> | Format-List *"
+}
+
+# --- PIM-eligible group membership (separate from active membership above) ---
+# Some groups -- confirmed on this tenant for BDECompute-Platform-SuperAdmins-Prod,
+# which is NOT a role-assignable group (isAssignableToRole: false) -- have zero
+# ACTIVE members by design: access is granted via PIM "eligible" assignments that
+# only become real ("active") when a user activates them. Get-AzADGroupMember only
+# ever sees active membership. This queries eligibility schedules separately so
+# eligible-but-not-activated access still shows up in the report, clearly marked
+# "Eligible" rather than "Active" so the two aren't confused.
+# Requires the Microsoft Graph PrivilegedAccess.Read.AzureADGroup permission on
+# whichever identity runs this. Without it, this 403s -- caught below, reported
+# once, and the script continues using active-membership data only (previous
+# behavior), so this is safe to leave in even before that permission is granted.
+
+$groupEligibleMembersById = @{}  # GroupObjectId -> array of normalized {UserPrincipalName, DisplayName} objects
+$pimAvailable = $true
+$pimErrorMessage = $null
+
+function Get-GraphBearerToken {
+  $tokenObj = Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com"
+  if ($tokenObj.Token -is [securestring]) {
+    return [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenObj.Token))
+  }
+  return $tokenObj.Token
+}
+
+Write-Host "Checking PIM-eligible group membership (requires PrivilegedAccess.Read.AzureADGroup)..."
+try {
+  $graphHeaders = @{ Authorization = "Bearer $(Get-GraphBearerToken)" }
+  $uri = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules?`$expand=principal"
+  $eligiblePrincipalsByGroup = @{}
+  do {
+    $resp = Invoke-RestMethod -Uri $uri -Headers $graphHeaders -ErrorAction Stop
+    foreach ($sched in $resp.value) {
+      if (-not $eligiblePrincipalsByGroup.ContainsKey($sched.groupId)) {
+        $eligiblePrincipalsByGroup[$sched.groupId] = @()
+      }
+      $eligiblePrincipalsByGroup[$sched.groupId] += $sched.principal
+    }
+    $uri = $resp.'@odata.nextLink'
+  } while ($uri)
+
+  foreach ($groupId in $eligiblePrincipalsByGroup.Keys) {
+    $resolved = foreach ($p in $eligiblePrincipalsByGroup[$groupId]) {
+      if ($p.'@odata.type' -eq '#microsoft.graph.user') {
+        [pscustomobject]@{ UserPrincipalName = $p.userPrincipalName; DisplayName = $p.displayName }
+      }
+      # Eligible group-as-principal (nested eligibility) is not expanded further,
+      # consistent with the active-membership limitation documented above.
+    }
+    $groupEligibleMembersById[$groupId] = @($resolved | Where-Object { $_.UserPrincipalName })
+  }
+  $eligibleCount = ($groupEligibleMembersById.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+  Write-Host "  PIM eligibility data available -- $eligibleCount eligible user assignments found across $($groupEligibleMembersById.Keys.Count) groups."
+} catch {
+  $pimAvailable = $false
+  $pimErrorMessage = $_.Exception.Message
+  Write-Warning "PIM eligibility data not available ($pimErrorMessage) -- continuing with active-membership data only. Grant PrivilegedAccess.Read.AzureADGroup to close this gap; see the README in this folder."
 }
 
 # --- Per-subscription role assignment collection ---
@@ -172,21 +234,34 @@ function Get-SubscriptionAccessRows {
   foreach ($a in $assignments) {
     switch ($a.ObjectType) {
       "User" {
+        # Get-AzRoleAssignment only ever returns ACTIVE assignments -- a
+        # directly-assigned role that's PIM-eligible-but-not-activated
+        # wouldn't appear here at all (a separate, narrower gap than the
+        # group-eligibility one this script now covers; not yet handled).
         $row = Get-OrCreateUserRow -Upn $a.SignInName -DisplayName $a.DisplayName
-        $row["Role: $($a.RoleDefinitionName)"] = "Yes"
+        $row["Role: $($a.RoleDefinitionName)"] = "Active"
       }
       "Group" {
         if (-not $groupMembersById.ContainsKey($a.ObjectId)) {
           Write-Warning "Group $($a.DisplayName) ($($a.ObjectId)) holds role $($a.RoleDefinitionName) but wasn't in the tenant group index -- skipped (may have been deleted since the index was built)."
           continue
         }
-        $members = $groupMembersById[$a.ObjectId]
-        if ($members.Count -eq 0) {
-          Write-Warning "Group $($a.DisplayName) ($($a.ObjectId)) holds role $($a.RoleDefinitionName) but resolved to zero members -- either genuinely empty, or Get-AzADGroupMember's return shape didn't match (see the warning printed during index building, if any)."
+        $activeMembers = $groupMembersById[$a.ObjectId]
+        $eligibleMembers = if ($groupEligibleMembersById.ContainsKey($a.ObjectId)) { $groupEligibleMembersById[$a.ObjectId] } else { @() }
+        if ($activeMembers.Count -eq 0 -and $eligibleMembers.Count -eq 0) {
+          Write-Warning "Group $($a.DisplayName) ($($a.ObjectId)) holds role $($a.RoleDefinitionName) but resolved to zero active or eligible members."
         }
-        foreach ($m in $members) {
+        foreach ($m in $activeMembers) {
           $row = Get-OrCreateUserRow -Upn $m.UserPrincipalName -DisplayName $m.DisplayName
-          $row["Role: $($a.RoleDefinitionName)"] = "Yes"
+          $row["Role: $($a.RoleDefinitionName)"] = "Active"
+        }
+        foreach ($m in $eligibleMembers) {
+          $row = Get-OrCreateUserRow -Upn $m.UserPrincipalName -DisplayName $m.DisplayName
+          # Don't downgrade a cell that's already "Active" via some other path
+          # (e.g. direct assignment, or active in a different group with the same role).
+          if ($row["Role: $($a.RoleDefinitionName)"] -ne "Active") {
+            $row["Role: $($a.RoleDefinitionName)"] = "Eligible"
+          }
         }
       }
       default { $otherCount++ }
@@ -195,12 +270,21 @@ function Get-SubscriptionAccessRows {
 
   Write-Host "  $($userRows.Count) distinct users, $otherCount service-principal/other assignments excluded from rows."
 
-  # Group membership columns: pure in-memory lookup against the index built
-  # above -- no additional Graph calls.
+  # Group membership columns: pure in-memory lookup against the indexes built
+  # above -- no additional Graph calls. Active membership takes precedence
+  # over eligible if a user is somehow both (shouldn't normally happen).
   foreach ($groupId in $groupMembersById.Keys) {
     foreach ($m in $groupMembersById[$groupId]) {
       if ($userRows.ContainsKey($m.UserPrincipalName)) {
-        $userRows[$m.UserPrincipalName]["Group: $($groupNameById[$groupId])"] = "Yes"
+        $userRows[$m.UserPrincipalName]["Group: $($groupNameById[$groupId])"] = "Active"
+      }
+    }
+  }
+  foreach ($groupId in $groupEligibleMembersById.Keys) {
+    $groupLabel = if ($groupNameById.ContainsKey($groupId)) { $groupNameById[$groupId] } else { $groupId }
+    foreach ($m in $groupEligibleMembersById[$groupId]) {
+      if ($userRows.ContainsKey($m.UserPrincipalName) -and $userRows[$m.UserPrincipalName]["Group: $groupLabel"] -ne "Active") {
+        $userRows[$m.UserPrincipalName]["Group: $groupLabel"] = "Eligible"
       }
     }
   }
@@ -247,14 +331,19 @@ $roleDefRows = foreach ($roleName in $observedRoleNames) {
 
 $emptyGroupCount = @($groupMembersById.Values | Where-Object { $_.Count -eq 0 }).Count
 $limitationsNote = @(
-  [pscustomobject]@{ Note = "KNOWN LIMITATION -- read before relying on this report for an access decision." }
+  [pscustomobject]@{ Note = "NOTES -- read before relying on this report for an access decision." }
   [pscustomobject]@{ Note = "" }
-  [pscustomobject]@{ Note = "Roles granted via Entra groups marked 'assignable to Azure roles' (e.g. the BDECompute-Platform-* / BDECompute-*-SuperAdmins groups used to grant Owner, Contributor, AcrPush, and most Key Vault/Storage roles) are NOT reflected below." }
-  [pscustomobject]@{ Note = "Confirmed cause: Microsoft Graph restricts membership visibility for role-assignable groups beyond normal group-read permissions -- Get-AzADGroupMember returns zero members for these groups even for an account with full admin rights, because the restriction applies to the calling application's Graph permission scope, not the signed-in user's own access." }
-  [pscustomobject]@{ Note = "Of $($allGroups.Count) Entra groups scanned, $emptyGroupCount returned zero resolvable members -- some of those are genuinely empty non-RBAC groups, but this includes every BDECompute-* role-assignable group checked so far." }
-  [pscustomobject]@{ Note = "What IS reliable below: roles assigned directly to individual users, and membership in ordinary (non-role-assignable) groups." }
-  [pscustomobject]@{ Note = "What's missing: anyone whose Owner/Contributor/AcrPush/etc. access comes ONLY through a role-assignable group membership will not appear with that role in this report." }
-  [pscustomobject]@{ Note = "Fix path (not yet applied): grant the reporting identity the Microsoft Graph RoleManagement.Read.Directory permission, which is scoped specifically to reading role-assignable group membership." }
+  [pscustomobject]@{ Note = "Cell values: 'Active' = currently in effect. 'Eligible' = a PIM-eligible assignment that has NOT been activated -- the person could gain this access on demand but does not have it right now." }
+  [pscustomobject]@{ Note = "" }
+  if ($pimAvailable) {
+    [pscustomobject]@{ Note = "PIM-eligible group membership: AVAILABLE this run. Groups like BDECompute-Platform-SuperAdmins-Prod are managed via PIM 'eligible' (just-in-time) membership rather than standing membership -- earlier runs of this script showed these as empty because Get-AzADGroupMember only ever sees ACTIVE membership, not eligible. This run additionally queried PIM eligibility schedules and merged them in as 'Eligible', so admin-group access that's real but not currently activated should now be visible." }
+  } else {
+    [pscustomobject]@{ Note = "PIM-eligible group membership: NOT AVAILABLE this run ($pimErrorMessage). Groups managed via PIM 'eligible' (just-in-time) membership -- e.g. BDECompute-Platform-SuperAdmins-Prod, and likely other *-SuperAdmins/-Admins groups -- will show zero members here even though people ARE eligible to activate access. Grant the reporting identity's Microsoft Graph permissions the PrivilegedAccess.Read.AzureADGroup scope to close this gap; see scripts/access-review/README.md." }
+  }
+  [pscustomobject]@{ Note = "" }
+  [pscustomobject]@{ Note = "Of $($allGroups.Count) Entra groups scanned, $emptyGroupCount had zero ACTIVE members. Some are genuinely empty/unused groups; others (like the SuperAdmins groups) are PIM-eligible-only by design -- see the Eligible-marked cells for those." }
+  [pscustomobject]@{ Note = "Not covered even with PIM data available: a role assigned DIRECTLY to a user (not via any group) that is itself PIM-eligible-but-not-activated. Get-AzRoleAssignment only returns active role assignments; this is a separate, narrower gap not yet addressed." }
+  [pscustomobject]@{ Note = "Nested group membership (a group added as a member of another group) is not expanded -- only direct members/eligible principals are resolved." }
 )
 
 Write-Output "Writing workbook to $OutputPath..."
