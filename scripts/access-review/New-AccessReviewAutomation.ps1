@@ -99,6 +99,19 @@ if (-not $existingStorageRole) {
     -RoleDefinitionName "Storage Blob Data Contributor" | Out-Null
 }
 
+# Control-plane role, scoped to just this one storage account. The runbook
+# needs this to flip networkAcls.defaultAction Allow/Deny around its upload
+# step (see Set-StorageFirewallDefaultAction in Get-AzureAccessReview.ps1) --
+# Storage Blob Data Contributor above is data-plane only and can't touch
+# network ACLs.
+Write-Host "Granting Storage Account Contributor (control-plane, for the firewall toggle) on the destination storage account..." -ForegroundColor Cyan
+$existingControlPlaneRole = Get-AzRoleAssignment -ObjectId $principalId -Scope $StorageAccountResourceId `
+  -RoleDefinitionName "Storage Account Contributor" -ErrorAction SilentlyContinue
+if (-not $existingControlPlaneRole) {
+  New-AzRoleAssignment -ObjectId $principalId -Scope $StorageAccountResourceId `
+    -RoleDefinitionName "Storage Account Contributor" | Out-Null
+}
+
 Write-Host "Importing runbook $RunbookName..." -ForegroundColor Cyan
 $scriptPath = Join-Path $PSScriptRoot "Get-AzureAccessReview.ps1"
 Import-AzAutomationRunbook -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName `
@@ -161,8 +174,8 @@ Run this as a Global Admin (PowerShell, Microsoft Graph SDK):
   # zero members even though people are eligible to activate access into
   # them. The other two are for ordinary group/user lookups. The report
   # runs fine without PrivilegedAccess.Read.AzureADGroup, it just won't
-  # show "Eligible" rows for PIM-managed groups (its "READ ME -
-  # Limitations" sheet says so explicitly when this is missing).
+  # show "Eligible" rows for PIM-managed groups; check the runbook job's
+  # verbose logs to see whether PIM data was available on a given run.
 
 Also import these modules into the Automation Account from the portal
 (Automation Account > Modules > Browse gallery) before the first run:

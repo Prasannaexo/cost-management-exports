@@ -25,9 +25,8 @@ users **"Eligible"** in the report (vs **"Active"** for real, current
 access) -- see the methodology notes in
 [Get-AzureAccessReview.ps1](Get-AzureAccessReview.ps1). This needs one
 additional Graph permission the reporting identity may not have yet; see
-"Closing the PIM-eligibility gap" below. The generated workbook's
-"READ ME - Limitations" sheet reports, on every run, whether that
-permission was actually available.
+"Closing the PIM-eligibility gap" below. Check the runbook job's verbose
+logs to see whether that permission was actually available on a given run.
 
 ## Why an Azure Automation runbook instead of Cost Management's native scheduling
 
@@ -104,9 +103,32 @@ Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/identityGovernance/priv
 ```
 A 403 means the permission hasn't propagated yet or wasn't granted to the
 right identity; a 200 with data (or an empty `value` array, which is a
-valid "nobody eligible right now" answer) means it worked. Re-run the
-report afterward -- the "READ ME - Limitations" sheet will say "PIM
-eligibility data: AVAILABLE" instead of "NOT AVAILABLE" once it's live.
+valid "nobody eligible right now" answer) means it worked.
+
+## Storage firewall exposure window
+
+`stldmcostexports` sits at `defaultAction: Deny` by default, same as the
+Cost Management exports storage account -- Cost Management writes still
+work because the account's `bypass: AzureServices` setting already covers
+it. Azure Automation isn't on that trusted list, and (confirmed against
+Microsoft docs) Automation Accounts can't use storage resource instance
+rules, and Automation cloud jobs can't reach private-endpoint-secured
+resources at all -- so there's no way to give the runbook a standing,
+narrowly-scoped exception the way an IP rule does for a person's machine.
+
+Instead, `Get-AzureAccessReview.ps1` flips `defaultAction` to `Allow`
+immediately before uploading the workbook and back to `Deny` in a
+`finally` block right after (see `Set-StorageFirewallDefaultAction`) --
+open only for the seconds it takes to upload one file, not for the whole
+run. This needs the "Storage Account Contributor" role (control-plane,
+scoped to just this storage account) on top of the existing "Storage Blob
+Data Contributor" (data-plane) role -- `New-AccessReviewAutomation.ps1`
+grants both.
+
+If the runbook is killed mid-run, the firewall could be left open; check
+`az storage account show --name stldmcostexports --resource-group
+rg-cost-exports --query networkRuleSet.defaultAction` after an
+unexpectedly-terminated job and reset to `Deny` manually if needed.
 
 ## Testing before the schedule fires
 

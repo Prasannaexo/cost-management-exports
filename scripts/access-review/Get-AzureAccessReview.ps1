@@ -435,14 +435,51 @@ Remove-Item -Path $OutputPath -ErrorAction SilentlyContinue
 (ConvertTo-UniformRows $allRows)  | Export-Excel -Path $OutputPath -WorksheetName "All Subscriptions" -AutoSize -FreezeTopRow -BoldTopRow
 (ConvertTo-UniformRows $roleDefRows) | Export-Excel -Path $OutputPath -WorksheetName "Role Definitions" -AutoSize -FreezeTopRow -BoldTopRow
 
+function Set-StorageFirewallDefaultAction {
+  # Automation Accounts aren't on Microsoft's supported list for storage
+  # resource instance rules, and Automation cloud jobs architecturally
+  # cannot reach private-endpoint-secured resources at all -- both confirmed
+  # against Microsoft docs. Toggling defaultAction is the only lever left,
+  # so the account sits at Deny by default (see New-CostExportStorage.ps1)
+  # and this narrows the exposure window to just the upload below instead
+  # of leaving the firewall open indefinitely.
+  param([string]$StorageAccountResourceId, [ValidateSet("Allow", "Deny")][string]$DefaultAction)
+  $path = "$($StorageAccountResourceId)?api-version=2023-01-01"
+  $current = Invoke-AzRestMethod -Method GET -Path $path
+  if ($current.StatusCode -ge 300) { throw "Failed to read storage account network config: $($current.Content)" }
+  $account = $current.Content | ConvertFrom-Json
+  $account.properties.networkAcls.defaultAction = $DefaultAction
+  $body = @{ properties = @{ networkAcls = $account.properties.networkAcls } } | ConvertTo-Json -Depth 10
+  $update = Invoke-AzRestMethod -Method PATCH -Path $path -Payload $body
+  if ($update.StatusCode -ge 300) { throw "Failed to set storage firewall defaultAction=$DefaultAction : $($update.Content)" }
+}
+
 Write-Output "Uploading to storage..."
 $storageAccountName = ($StorageAccountResourceId -split "/")[-1]
-$ctx = New-AzStorageContext -StorageAccountName $storageAccountName -UseConnectedAccount
-$container = Get-AzStorageContainer -Name $ContainerName -Context $ctx -ErrorAction SilentlyContinue
-if (-not $container) {
-  New-AzStorageContainer -Name $ContainerName -Context $ctx -Permission Off | Out-Null
-}
 $blobName = "{0:yyyyMM}/azure-access-review-{0:yyyyMMdd}.xlsx" -f (Get-Date)
-Set-AzStorageBlobContent -File $OutputPath -Container $ContainerName -Blob $blobName -Context $ctx -Force | Out-Null
+
+Write-Verbose "Opening storage firewall for upload..." -Verbose
+Set-StorageFirewallDefaultAction -StorageAccountResourceId $StorageAccountResourceId -DefaultAction "Allow"
+try {
+  $maxAttempts = 6
+  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+    try {
+      $ctx = New-AzStorageContext -StorageAccountName $storageAccountName -UseConnectedAccount
+      $container = Get-AzStorageContainer -Name $ContainerName -Context $ctx -ErrorAction SilentlyContinue
+      if (-not $container) {
+        New-AzStorageContainer -Name $ContainerName -Context $ctx -Permission Off | Out-Null
+      }
+      Set-AzStorageBlobContent -File $OutputPath -Container $ContainerName -Blob $blobName -Context $ctx -Force | Out-Null
+      break
+    } catch {
+      if ($attempt -eq $maxAttempts) { throw }
+      Write-Verbose "Upload attempt $attempt failed (firewall rule likely not yet propagated): $($_.Exception.Message). Retrying in 15s..." -Verbose
+      Start-Sleep -Seconds 15
+    }
+  }
+} finally {
+  Write-Verbose "Closing storage firewall..." -Verbose
+  Set-StorageFirewallDefaultAction -StorageAccountResourceId $StorageAccountResourceId -DefaultAction "Deny"
+}
 
 Write-Output "Done. Uploaded to $ContainerName/$blobName"
