@@ -171,28 +171,38 @@ function Get-GraphBearerToken {
 Write-Host "Checking PIM-eligible group membership (requires PrivilegedAccess.Read.AzureADGroup)..."
 try {
   $graphHeaders = @{ Authorization = "Bearer $(Get-GraphBearerToken)" }
-  $uri = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules?`$expand=principal"
-  $eligiblePrincipalsByGroup = @{}
+  # No $expand=principal here -- that combination 400'd against this endpoint.
+  # Resolve principals separately via Get-AzADUser instead, reusing the same
+  # cmdlet already used elsewhere in this script rather than guessing at Graph
+  # $expand support further.
+  $uri = "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules"
+  $eligiblePrincipalIdsByGroup = @{}
   do {
     $resp = Invoke-RestMethod -Uri $uri -Headers $graphHeaders -ErrorAction Stop
     foreach ($sched in $resp.value) {
-      if (-not $eligiblePrincipalsByGroup.ContainsKey($sched.groupId)) {
-        $eligiblePrincipalsByGroup[$sched.groupId] = @()
+      if (-not $eligiblePrincipalIdsByGroup.ContainsKey($sched.groupId)) {
+        $eligiblePrincipalIdsByGroup[$sched.groupId] = @()
       }
-      $eligiblePrincipalsByGroup[$sched.groupId] += $sched.principal
+      $eligiblePrincipalIdsByGroup[$sched.groupId] += $sched.principalId
     }
     $uri = $resp.'@odata.nextLink'
   } while ($uri)
 
-  foreach ($groupId in $eligiblePrincipalsByGroup.Keys) {
-    $resolved = foreach ($p in $eligiblePrincipalsByGroup[$groupId]) {
-      if ($p.'@odata.type' -eq '#microsoft.graph.user') {
-        [pscustomobject]@{ UserPrincipalName = $p.userPrincipalName; DisplayName = $p.displayName }
-      }
-      # Eligible group-as-principal (nested eligibility) is not expanded further,
-      # consistent with the active-membership limitation documented above.
+  # Resolve each unique principal once, not once per group it's eligible for.
+  $allPrincipalIds = @($eligiblePrincipalIdsByGroup.Values | ForEach-Object { $_ } | Select-Object -Unique)
+  $resolvedPrincipals = @{}  # principalId -> {UserPrincipalName, DisplayName} or $null if not a user (e.g. a nested group)
+  foreach ($pid in $allPrincipalIds) {
+    try {
+      $u = Get-AzADUser -ObjectId $pid -ErrorAction Stop
+      $resolvedPrincipals[$pid] = [pscustomobject]@{ UserPrincipalName = $u.UserPrincipalName; DisplayName = $u.DisplayName }
+    } catch {
+      $resolvedPrincipals[$pid] = $null  # not a user (group/service principal) -- not expanded further, same as active-membership limitation
     }
-    $groupEligibleMembersById[$groupId] = @($resolved | Where-Object { $_.UserPrincipalName })
+  }
+
+  foreach ($groupId in $eligiblePrincipalIdsByGroup.Keys) {
+    $resolved = @($eligiblePrincipalIdsByGroup[$groupId] | ForEach-Object { $resolvedPrincipals[$_] } | Where-Object { $_ })
+    $groupEligibleMembersById[$groupId] = $resolved
   }
   $eligibleCount = ($groupEligibleMembersById.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
   Write-Host "  PIM eligibility data available -- $eligibleCount eligible user assignments found across $($groupEligibleMembersById.Keys.Count) groups."
@@ -213,12 +223,23 @@ function Get-SubscriptionAccessRows {
   # Write-Output here would silently prepend these status strings onto the
   # actual row data, corrupting the Excel output. Write-Host bypasses that.
   Write-Host "Collecting role assignments for $Label ($SubscriptionId)..."
-  Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+  $context = Set-AzContext -SubscriptionId $SubscriptionId
+  if (-not $context -or $context.Subscription.Id -ne $SubscriptionId) {
+    throw "Set-AzContext did not switch to subscription $SubscriptionId for $Label -- got '$($context.Subscription.Id)' instead. Aborting rather than silently reporting the wrong (or no) subscription's data."
+  }
 
   # No -Scope filter: returns every assignment across every resource in the
   # subscription, not just the subscription-root scope (confirmed behavior
   # during this project's earlier manual RBAC checks).
-  $assignments = Get-AzRoleAssignment
+  try {
+    $assignments = @(Get-AzRoleAssignment -ErrorAction Stop)
+  } catch {
+    throw "Get-AzRoleAssignment failed for $Label ($SubscriptionId): $_"
+  }
+  Write-Host "  Get-AzRoleAssignment returned $($assignments.Count) assignment(s) for $Label."
+  if ($assignments.Count -eq 0) {
+    Write-Warning "Zero role assignments returned for $Label ($SubscriptionId). If this subscription has any RBAC assignments at all (nearly all do -- Owner/Contributor/etc. at minimum), this points to a permission or context problem for the identity running this script, not a genuinely empty subscription."
+  }
 
   $userRows = @{}       # UPN -> ordered hashtable of columns
   $otherCount = 0
@@ -289,12 +310,20 @@ function Get-SubscriptionAccessRows {
     }
   }
 
-  return @($userRows.Values | ForEach-Object { [pscustomobject]$_ })
+  # Unary comma is load-bearing: without it, "return @(emptyOrOneItemCollection)"
+  # gets unrolled by PowerShell's pipeline output semantics, so a genuinely
+  # empty result becomes $null (not @()) once captured by the caller, and a
+  # single-item result becomes that bare item instead of a 1-element array.
+  # Confirmed to matter here: a run that found zero assignments produced
+  # $null instead of an empty array, which downstream became a 1-element
+  # array containing $null when re-wrapped with @(...), which Export-Excel
+  # then rendered as garbage placeholder rows instead of an empty sheet.
+  return ,@($userRows.Values | ForEach-Object { [pscustomobject]$_ })
 }
 
 function Add-SubscriptionLabel {
   param([object[]]$Rows, [string]$Label)
-  return @($Rows | ForEach-Object {
+  return ,@($Rows | ForEach-Object {
     $h = [ordered]@{ Subscription = $Label }
     foreach ($p in $_.PSObject.Properties) { $h[$p.Name] = $p.Value }
     [pscustomobject]$h
