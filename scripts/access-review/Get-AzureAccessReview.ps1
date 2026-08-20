@@ -258,39 +258,47 @@ function Get-SubscriptionAccessRows {
   }
 
   foreach ($a in $assignments) {
-    switch ($a.ObjectType) {
-      "User" {
-        # Get-AzRoleAssignment only ever returns ACTIVE assignments -- a
-        # directly-assigned role that's PIM-eligible-but-not-activated
-        # wouldn't appear here at all (a separate, narrower gap than the
-        # group-eligibility one this script now covers; not yet handled).
-        $row = Get-OrCreateUserRow -Upn $a.SignInName -DisplayName $a.DisplayName
+    # Deliberately NOT switching on $a.ObjectType: confirmed via a real run
+    # that when this script runs as the Automation Account's managed
+    # identity, ObjectType comes back as something other than the clean
+    # "User"/"Group" strings it returns for an interactive user session
+    # (every one of 295+252+84 assignments landed in "other" this way,
+    # despite the same subscriptions showing 493+ users when run
+    # interactively). Classify using signals resolved independently instead:
+    # a populated SignInName means a user (Get-AzRoleAssignment always
+    # resolves this for user principals); an ObjectId matching the tenant
+    # group index built earlier means a group. Both are more reliable here
+    # than trusting ObjectType's exact value.
+    if ($a.SignInName) {
+      # Get-AzRoleAssignment only ever returns ACTIVE assignments -- a
+      # directly-assigned role that's PIM-eligible-but-not-activated
+      # wouldn't appear here at all (a separate, narrower gap than the
+      # group-eligibility one this script now covers; not yet handled).
+      $row = Get-OrCreateUserRow -Upn $a.SignInName -DisplayName $a.DisplayName
+      $row["Role: $($a.RoleDefinitionName)"] = "Active"
+    } elseif ($groupNameById.ContainsKey($a.ObjectId)) {
+      $activeMembers = $groupMembersById[$a.ObjectId]
+      $eligibleMembers = if ($groupEligibleMembersById.ContainsKey($a.ObjectId)) { $groupEligibleMembersById[$a.ObjectId] } else { @() }
+      if ($activeMembers.Count -eq 0 -and $eligibleMembers.Count -eq 0) {
+        Write-Warning "Group $($groupNameById[$a.ObjectId]) ($($a.ObjectId)) holds role $($a.RoleDefinitionName) but resolved to zero active or eligible members."
+      }
+      foreach ($m in $activeMembers) {
+        $row = Get-OrCreateUserRow -Upn $m.UserPrincipalName -DisplayName $m.DisplayName
         $row["Role: $($a.RoleDefinitionName)"] = "Active"
       }
-      "Group" {
-        if (-not $groupMembersById.ContainsKey($a.ObjectId)) {
-          Write-Warning "Group $($a.DisplayName) ($($a.ObjectId)) holds role $($a.RoleDefinitionName) but wasn't in the tenant group index -- skipped (may have been deleted since the index was built)."
-          continue
-        }
-        $activeMembers = $groupMembersById[$a.ObjectId]
-        $eligibleMembers = if ($groupEligibleMembersById.ContainsKey($a.ObjectId)) { $groupEligibleMembersById[$a.ObjectId] } else { @() }
-        if ($activeMembers.Count -eq 0 -and $eligibleMembers.Count -eq 0) {
-          Write-Warning "Group $($a.DisplayName) ($($a.ObjectId)) holds role $($a.RoleDefinitionName) but resolved to zero active or eligible members."
-        }
-        foreach ($m in $activeMembers) {
-          $row = Get-OrCreateUserRow -Upn $m.UserPrincipalName -DisplayName $m.DisplayName
-          $row["Role: $($a.RoleDefinitionName)"] = "Active"
-        }
-        foreach ($m in $eligibleMembers) {
-          $row = Get-OrCreateUserRow -Upn $m.UserPrincipalName -DisplayName $m.DisplayName
-          # Don't downgrade a cell that's already "Active" via some other path
-          # (e.g. direct assignment, or active in a different group with the same role).
-          if ($row["Role: $($a.RoleDefinitionName)"] -ne "Active") {
-            $row["Role: $($a.RoleDefinitionName)"] = "Eligible"
-          }
+      foreach ($m in $eligibleMembers) {
+        $row = Get-OrCreateUserRow -Upn $m.UserPrincipalName -DisplayName $m.DisplayName
+        # Don't downgrade a cell that's already "Active" via some other path
+        # (e.g. direct assignment, or active in a different group with the same role).
+        if ($row["Role: $($a.RoleDefinitionName)"] -ne "Active") {
+          $row["Role: $($a.RoleDefinitionName)"] = "Eligible"
         }
       }
-      default { $otherCount++ }
+    } else {
+      # Neither a resolvable user nor a group in our tenant-wide index --
+      # genuinely a service principal/managed identity, or a group that was
+      # deleted since the index was built at the top of this script.
+      $otherCount++
     }
   }
 
