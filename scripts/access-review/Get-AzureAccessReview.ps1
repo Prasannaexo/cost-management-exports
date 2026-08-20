@@ -52,10 +52,9 @@ eligibilitySchedules) and merges eligible-but-inactive assignments into
 the report as "Eligible" (vs "Active" for real, current access) --
 see Get-GraphBearerToken and the PIM section below. This requires the
 PrivilegedAccess.Read.AzureADGroup Graph permission; without it, this
-degrades gracefully to active-membership-only (previous behavior) and
-the generated workbook's "READ ME - Limitations" sheet says so
-explicitly, including whether PIM data was actually available on that
-specific run.
+degrades gracefully to active-membership-only (previous behavior); check
+the runbook job's verbose logs for whether PIM data was actually available
+on a given run.
 
 Performance: group membership is tenant-wide, not per-subscription, so it's
 resolved ONCE (a single pass over every Entra group) and reused for both
@@ -378,9 +377,9 @@ $prodRows = Get-SubscriptionAccessRows -SubscriptionId $ProductionSubscriptionId
 $testRows = Get-SubscriptionAccessRows -SubscriptionId $TestSubscriptionId -Label "Test"
 $devRows  = Get-SubscriptionAccessRows -SubscriptionId $DevSubscriptionId -Label "Dev"
 
-$allRows = @(Add-SubscriptionLabel -Rows $prodRows -Label "Production") +
-           @(Add-SubscriptionLabel -Rows $testRows -Label "Test") +
-           @(Add-SubscriptionLabel -Rows $devRows -Label "Dev")
+$allRows = (Add-SubscriptionLabel -Rows $prodRows -Label "Production") +
+           (Add-SubscriptionLabel -Rows $testRows -Label "Test") +
+           (Add-SubscriptionLabel -Rows $devRows -Label "Dev")
 
 Write-Output "Building Role Definitions reference sheet..."
 $observedRoleNames = @($prodRows + $testRows + $devRows | ForEach-Object {
@@ -401,23 +400,6 @@ $roleDefRows = foreach ($roleName in $observedRoleNames) {
     }
   }
 }
-
-$emptyGroupCount = @($groupMembersById.Values | Where-Object { $_.Count -eq 0 }).Count
-$limitationsNote = @(
-  [pscustomobject]@{ Note = "NOTES -- read before relying on this report for an access decision." }
-  [pscustomobject]@{ Note = "" }
-  [pscustomobject]@{ Note = "Cell values: 'Active' = currently in effect. 'Eligible' = a PIM-eligible assignment that has NOT been activated -- the person could gain this access on demand but does not have it right now." }
-  [pscustomobject]@{ Note = "" }
-  if ($pimAvailable) {
-    [pscustomobject]@{ Note = "PIM-eligible group membership: AVAILABLE this run. Groups like BDECompute-Platform-SuperAdmins-Prod are managed via PIM 'eligible' (just-in-time) membership rather than standing membership -- earlier runs of this script showed these as empty because Get-AzADGroupMember only ever sees ACTIVE membership, not eligible. This run additionally queried PIM eligibility schedules and merged them in as 'Eligible', so admin-group access that's real but not currently activated should now be visible." }
-  } else {
-    [pscustomobject]@{ Note = "PIM-eligible group membership: NOT AVAILABLE this run ($pimErrorMessage). Groups managed via PIM 'eligible' (just-in-time) membership -- e.g. BDECompute-Platform-SuperAdmins-Prod, and likely other *-SuperAdmins/-Admins groups -- will show zero members here even though people ARE eligible to activate access. Grant the reporting identity's Microsoft Graph permissions the PrivilegedAccess.Read.AzureADGroup scope to close this gap; see scripts/access-review/README.md." }
-  }
-  [pscustomobject]@{ Note = "" }
-  [pscustomobject]@{ Note = "Of $($allGroups.Count) Entra groups scanned, $emptyGroupCount had zero ACTIVE members. Some are genuinely empty/unused groups; others (like the SuperAdmins groups) are PIM-eligible-only by design -- see the Eligible-marked cells for those." }
-  [pscustomobject]@{ Note = "Not covered even with PIM data available: a role assigned DIRECTLY to a user (not via any group) that is itself PIM-eligible-but-not-activated. Get-AzRoleAssignment only returns active role assignments; this is a separate, narrower gap not yet addressed." }
-  [pscustomobject]@{ Note = "Nested group membership (a group added as a member of another group) is not expanded -- only direct members/eligible principals are resolved." }
-)
 
 function ConvertTo-UniformRows {
   # Export-Excel derives its column headers from the FIRST object in the
@@ -447,7 +429,6 @@ function ConvertTo-UniformRows {
 
 Write-Output "Writing workbook to $OutputPath..."
 Remove-Item -Path $OutputPath -ErrorAction SilentlyContinue
-$limitationsNote | Export-Excel -Path $OutputPath -WorksheetName "READ ME - Limitations" -AutoSize -NoHeader
 (ConvertTo-UniformRows $prodRows) | Export-Excel -Path $OutputPath -WorksheetName "Production" -AutoSize -FreezeTopRow -BoldTopRow
 (ConvertTo-UniformRows $testRows) | Export-Excel -Path $OutputPath -WorksheetName "Test" -AutoSize -FreezeTopRow -BoldTopRow
 (ConvertTo-UniformRows $devRows)  | Export-Excel -Path $OutputPath -WorksheetName "Dev" -AutoSize -FreezeTopRow -BoldTopRow
