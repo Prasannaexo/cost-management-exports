@@ -172,6 +172,12 @@ Option A query is proven out.
 Either way, budget for the up-to-24-hour delay on the first file and the
 ~4-hour delay on subsequent daily runs when you set the refresh schedule.
 
+**Want a full FinOps-style dashboard** (day-wise trends, month-over-month
+comparison, service and subscription breakdowns, anomaly flagging) instead
+of a single query? See [scripts/power-bi/README.md](scripts/power-bi/README.md)
+for a parameter-driven query + DAX measure library and page-by-page layout,
+confirmed against this account's real export schema.
+
 ## Managing exports
 
 Via the portal (Cost Management > Exports at the relevant scope) or
